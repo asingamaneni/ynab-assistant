@@ -10,3 +10,4 @@ build/
 node_modules/
 .pytest_cache/
 .history/
+.playwright-mcp/
