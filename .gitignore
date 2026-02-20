@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.vercel/
+node_modules/
+.pytest_cache/
+.history/
+.playwright-mcp/
