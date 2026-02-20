@@ -148,6 +148,15 @@ async def ynab_verb_noun(params: SomeInput, ctx: Context) -> str:
 - **Test organization:** `TestClassName` per feature, `test_descriptive_behavior` methods
 - **One test file per source module:** `test_analyzers.py`, `test_categorizer.py`, etc.
 
+## Browser Automation Fallback
+
+When the YNAB API or MCP tools cannot perform an action (e.g., the API lacks an endpoint, delta caching returns stale data, or a UI-only feature is needed), use the Chrome browser automation tools (`mcp__claude-in-chrome__*`) to interact with the YNAB web app at `app.ynab.com`. This includes:
+
+- Deleting transactions (if the `ynab_delete_transaction` tool is not yet exposed)
+- Bulk operations not supported by the API
+- Verifying data when API results seem stale
+- Any YNAB feature only available in the web UI
+
 ## Environment
 
 - `YNAB_API_TOKEN` — required, obtain from https://app.ynab.com/settings/developer
