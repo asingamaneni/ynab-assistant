@@ -148,6 +148,14 @@ async def ynab_verb_noun(params: SomeInput, ctx: Context) -> str:
 - **Test organization:** `TestClassName` per feature, `test_descriptive_behavior` methods
 - **One test file per source module:** `test_analyzers.py`, `test_categorizer.py`, etc.
 
+## Documentation
+
+When making architectural changes, adding new tools/commands, or updating project setup:
+
+- **Always update `README.md`** to reflect the change (new commands, setup steps, project structure, etc.)
+- **Always update `CLAUDE.md`** if the change affects coding conventions, patterns, or architecture
+- Keep the Claude Code Commands table in README current when adding/removing `/commands`
+
 ## Browser Automation Fallback
 
 When the YNAB API or MCP tools cannot perform an action (e.g., the API lacks an endpoint, delta caching returns stale data, or a UI-only feature is needed), use the Chrome browser automation tools (`mcp__claude-in-chrome__*`) to interact with the YNAB web app at `app.ynab.com`. This includes:

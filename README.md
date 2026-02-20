@@ -55,38 +55,43 @@ ynab-assistant/
 
 ## Setup
 
-### 1. Get your YNAB API Token
+### Quick Setup (Claude Code)
+
+If you're using Claude Code, just run the `/setup` command — it handles everything automatically (venv, dependencies, MCP config).
+
+### Manual Setup
+
+#### 1. Get your YNAB API Token
 
 Go to https://app.ynab.com/settings/developer -> New Token -> Copy it.
 
-### 2. Configure Environment
+#### 2. Configure Environment
 
 ```bash
 cp .env.example .env
 # Add your YNAB_API_TOKEN to .env
 ```
 
-### 3. Install Dependencies
+#### 3. Install Dependencies
 
 ```bash
-pip install -r requirements.txt
+uv venv
+uv pip install -e ".[dev]"
 ```
 
-### 4. Add to Claude Desktop
+#### 4. Add to Claude Desktop
 
 Edit your Claude Desktop config file:
 
 - **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
-Add the following to the `mcpServers` object:
-
 ```json
 {
   "mcpServers": {
     "ynab": {
-      "command": "python",
-      "args": ["-m", "src.mcp.server"],
+      "command": "uv",
+      "args": ["run", "python", "-m", "src.mcp.server"],
       "cwd": "/absolute/path/to/ynab-assistant",
       "env": {
         "YNAB_API_TOKEN": "your-token-here"
@@ -96,11 +101,9 @@ Add the following to the `mcpServers` object:
 }
 ```
 
-Replace `/absolute/path/to/ynab-assistant` with the actual project path and `your-token-here` with your YNAB API token.
-
 Restart Claude Desktop to pick up the new server.
 
-### 5. Add to Claude Code
+#### 5. Add to Claude Code
 
 Add to your Claude Code settings (`~/.claude.json`):
 
@@ -108,8 +111,8 @@ Add to your Claude Code settings (`~/.claude.json`):
 {
   "mcpServers": {
     "ynab": {
-      "command": "python",
-      "args": ["-m", "src.mcp.server"],
+      "command": "uv",
+      "args": ["run", "python", "-m", "src.mcp.server"],
       "cwd": "/absolute/path/to/ynab-assistant",
       "env": {
         "YNAB_API_TOKEN": "your-token-here"
@@ -119,9 +122,14 @@ Add to your Claude Code settings (`~/.claude.json`):
 }
 ```
 
-### 6. Run Tests
+#### 6. Run Tests
 
 ```bash
-pip install -e ".[dev]"
-pytest
+uv run pytest
 ```
+
+## Claude Code Commands
+
+| Command | Description |
+|---------|-------------|
+| `/setup` | Create venv, install dependencies, and configure MCP server |
