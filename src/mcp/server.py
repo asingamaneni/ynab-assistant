@@ -9,6 +9,8 @@ import sys
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
+
 from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -27,49 +29,90 @@ from src.core.analyzers import (
     build_subtransactions,
     check_affordability,
     compute_budget_assignments,
+    compute_bulk_transaction_updates,
+    compute_category_target_updates,
+    compute_scheduled_transaction_updates,
+    compute_transaction_updates,
+    filter_scheduled_transaction_by_description,
+    filter_transaction_by_description,
     filter_transactions,
-    find_uncategorized_transactions,
+    filter_uncategorized_transactions,
     forecast_spending,
     validate_split_amounts,
 )
 from src.core.categorizer import Categorizer
-from src.core.resolvers import resolve_account, resolve_category
+from src.core.resolvers import (
+    resolve_account,
+    resolve_category,
+    resolve_category_or_inflow,
+    resolve_payee,
+)
 from src.core.ynab_client import YNABClient
 from src.mcp.error_handling import handle_tool_errors
 from src.mcp.formatters import (
+    format_account_created,
     format_accounts,
     format_affordability_check,
+    format_budget_settings,
     format_budget_setup_applied,
     format_budget_setup_preview,
     format_budget_summary,
     format_budgets,
+    format_bulk_update_result,
     format_category_detail,
+    format_category_metadata_updated,
+    format_category_targets,
+    format_category_target_set,
     format_credit_card_analysis,
+    format_import_result,
     format_learned_categories,
     format_move_result,
     format_overspending_analysis,
+    format_payee_locations,
+    format_payee_updated,
+    format_payees,
+    format_scheduled_transaction_created,
+    format_scheduled_transaction_deleted,
+    format_scheduled_transaction_updated,
+    format_scheduled_transactions,
     format_spending_forecast,
     format_spending_trends,
     format_split_transaction_created,
     format_transaction_categorized,
     format_transaction_created,
+    format_transaction_deleted,
+    format_transaction_recategorized,
+    format_transaction_updated,
     format_transactions,
     format_uncategorized_transactions,
+    format_user,
 )
-from src.models.results import SplitItem
+from src.models.results import SplitItem, TransactionUpdateResult
 from src.models.schemas import (
     AffordabilityCheckInput,
     BudgetSetupInput,
+    BulkUpdateTransactionsInput,
     CategorizeTransactionInput,
+    CreateAccountInput,
+    CreateScheduledTransactionInput,
     CreateSplitTransactionInput,
     CreateTransactionInput,
     CreateTransactionNLInput,
+    DeleteScheduledTransactionInput,
+    DeleteTransactionInput,
+    GetPayeeTransactionsInput,
     GetTransactionsInput,
     MoveBudgetInput,
+    RecategorizeTransactionInput,
     SearchTransactionsInput,
+    SetCategoryTargetInput,
     SpendingForecastInput,
     SpendingTrendInput,
     UpdateCategoryInput,
+    UpdateCategoryMetadataInput,
+    UpdatePayeeInput,
+    UpdateScheduledTransactionInput,
+    UpdateTransactionInput,
     dollars_to_milliunits,
     milliunits_to_dollars,
 )
@@ -492,7 +535,7 @@ async def ynab_uncategorized(ctx: Context) -> str:
     """List all uncategorized transactions for review."""
     ynab, _ = _get_deps(ctx)
     transactions = await ynab.get_transactions()
-    uncategorized = find_uncategorized_transactions(transactions)
+    uncategorized = filter_uncategorized_transactions(transactions)
     return format_uncategorized_transactions(uncategorized)
 
 
@@ -513,7 +556,7 @@ async def ynab_categorize_transaction(params: CategorizeTransactionInput, ctx: C
 
     # Find the uncategorized transaction matching the description
     transactions = await ynab.get_transactions()
-    uncategorized = find_uncategorized_transactions(transactions)
+    uncategorized = filter_uncategorized_transactions(transactions)
 
     query = params.transaction_description.lower()
     matched = None
@@ -533,8 +576,8 @@ async def ynab_categorize_transaction(params: CategorizeTransactionInput, ctx: C
     groups = await ynab.get_categories()
     cat = resolve_category(groups, params.category_name)
 
-    # Update the transaction
-    await ynab.update_transaction(matched.id, {"category_id": cat.id})
+    # Update the transaction and auto-approve (imported transactions need explicit approval)
+    await ynab.update_transaction(matched.id, {"category_id": cat.id, "approved": True})
 
     # Learn for future auto-categorization
     if matched.payee_name:
@@ -549,6 +592,133 @@ async def ynab_categorize_transaction(params: CategorizeTransactionInput, ctx: C
         matched.amount,
         cat.name,
     )
+
+
+@mcp.tool(
+    name="ynab_recategorize_transaction",
+    annotations={
+        "title": "Recategorize Transaction",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_recategorize_transaction(params: RecategorizeTransactionInput, ctx: Context) -> str:
+    """Change the category of any transaction, including already-categorized ones. Supports income (Inflow: Ready to Assign)."""
+    ynab, categorizer = _get_deps(ctx)
+
+    # Search all non-deleted transactions
+    transactions = await ynab.get_transactions()
+    matched = filter_transaction_by_description(transactions, params.transaction_description)
+
+    if not matched:
+        return f"No transaction found matching '{params.transaction_description}'."
+
+    # Resolve category (including inflow for income)
+    groups = await ynab.get_categories()
+    cat = resolve_category_or_inflow(groups, params.new_category_name)
+
+    # Update the transaction and auto-approve (imported transactions need explicit approval)
+    old_category = matched.category_name
+    await ynab.update_transaction(matched.id, {"category_id": cat.id, "approved": True})
+
+    # Learn for future auto-categorization (skip for inflow)
+    if matched.payee_name and "inflow" not in cat.name.lower():
+        categorizer.learn_from_transactions([{
+            "payee_name": matched.payee_name,
+            "category_id": cat.id,
+            "category_name": cat.name,
+        }])
+
+    return format_transaction_recategorized(
+        matched.payee_name or "Unknown",
+        matched.amount,
+        old_category,
+        cat.name,
+    )
+
+
+@mcp.tool(
+    name="ynab_update_transaction",
+    annotations={
+        "title": "Update Transaction",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_update_transaction(params: UpdateTransactionInput, ctx: Context) -> str:
+    """Update any editable field on an existing transaction (memo, category, payee, date, amount, flag, cleared, approved)."""
+    ynab, categorizer = _get_deps(ctx)
+
+    # 1. Find the transaction
+    transactions = await ynab.get_transactions()
+    matched = filter_transaction_by_description(transactions, params.transaction_description)
+    if not matched:
+        return f"No transaction found matching '{params.transaction_description}'."
+
+    # 2. Resolve category if provided
+    resolved_cat_id: str | None = None
+    resolved_cat_name: str | None = None
+    if params.category_name is not None:
+        groups = await ynab.get_categories()
+        cat = resolve_category_or_inflow(groups, params.category_name)
+        resolved_cat_id = cat.id
+        resolved_cat_name = cat.name
+
+    # 3. Convert amount if provided
+    amount_milliunits: int | None = None
+    if params.amount is not None:
+        if params.amount < 0:  # inflow/refund
+            amount_milliunits = dollars_to_milliunits(abs(params.amount))
+        else:
+            amount_milliunits = dollars_to_milliunits(-abs(params.amount))
+
+    # 4. Build update payload (pure)
+    updates, changes = compute_transaction_updates(
+        matched,
+        memo=params.memo,
+        category_id=resolved_cat_id,
+        category_name=resolved_cat_name,
+        payee_name=params.payee,
+        date=params.date,
+        amount_milliunits=amount_milliunits,
+        flag_color=params.flag_color.value if params.flag_color else None,
+        cleared=params.cleared.value if params.cleared else None,
+        approved=params.approved,
+    )
+
+    if not updates:
+        return (
+            f"No changes needed — the transaction at "
+            f"**{matched.payee_name or 'Unknown'}** already has those values."
+        )
+
+    # 5. Apply the update
+    result_txn = await ynab.update_transaction(matched.id, updates)
+
+    # 6. Learn category mapping if category was changed
+    if resolved_cat_id and "inflow" not in (resolved_cat_name or "").lower():
+        payee_for_learning = params.payee or matched.payee_name
+        if payee_for_learning:
+            categorizer.learn_from_transactions([{
+                "payee_name": payee_for_learning,
+                "category_id": resolved_cat_id,
+                "category_name": resolved_cat_name,
+            }])
+
+    # 7. Format and return
+    update_result = TransactionUpdateResult(
+        payee_name=result_txn.payee_name or matched.payee_name or "Unknown",
+        amount_milliunits=result_txn.amount,
+        date=result_txn.date,
+        changes=changes,
+    )
+    return format_transaction_updated(update_result)
 
 
 @mcp.tool(
@@ -762,6 +932,489 @@ async def ynab_spending_forecast(params: SpendingForecastInput, ctx: Context) ->
 
     result = forecast_spending(category, transactions)
     return format_spending_forecast(result)
+
+
+# --- New API Feature Tools ---
+
+
+@mcp.tool(
+    name="ynab_delete_transaction",
+    annotations={
+        "title": "Delete Transaction",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_delete_transaction(params: DeleteTransactionInput, ctx: Context) -> str:
+    """Delete a transaction by description (payee, date, or amount)."""
+    ynab, _ = _get_deps(ctx)
+
+    transactions = await ynab.get_transactions()
+    matched = filter_transaction_by_description(transactions, params.transaction_description)
+    if not matched:
+        return f"No transaction found matching '{params.transaction_description}'."
+
+    payee = matched.payee_name or "Unknown"
+    amount = matched.amount
+    txn_date = matched.date
+
+    await ynab.delete_transaction(matched.id)
+    return format_transaction_deleted(payee, amount, txn_date)
+
+
+@mcp.tool(
+    name="ynab_get_payees",
+    annotations={
+        "title": "List Payees",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_get_payees(ctx: Context) -> str:
+    """List all payees in the budget."""
+    ynab, _ = _get_deps(ctx)
+    payees = await ynab.get_payees()
+    return format_payees(payees)
+
+
+@mcp.tool(
+    name="ynab_update_payee",
+    annotations={
+        "title": "Rename Payee",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_update_payee(params: UpdatePayeeInput, ctx: Context) -> str:
+    """Rename a payee."""
+    ynab, _ = _get_deps(ctx)
+
+    payees = await ynab.get_payees()
+    matched = resolve_payee(payees, params.payee_name)
+    old_name = matched.name
+
+    await ynab.update_payee(matched.id, params.new_name)
+    return format_payee_updated(old_name, params.new_name)
+
+
+@mcp.tool(
+    name="ynab_update_category_metadata",
+    annotations={
+        "title": "Update Category Name/Note",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_update_category_metadata(params: UpdateCategoryMetadataInput, ctx: Context) -> str:
+    """Update a category's name or note."""
+    ynab, _ = _get_deps(ctx)
+
+    groups = await ynab.get_categories()
+    cat = resolve_category(groups, params.category_name)
+
+    updates: dict[str, str] = {}
+    if params.new_name is not None:
+        updates["name"] = params.new_name
+    if params.note is not None:
+        updates["note"] = params.note
+
+    await ynab.update_category_metadata(cat.id, updates)
+    return format_category_metadata_updated(
+        cat.name,
+        old_name=cat.name if params.new_name is not None else None,
+        new_name=params.new_name,
+        old_note=cat.note if params.note is not None else None,
+        new_note=params.note,
+    )
+
+
+@mcp.tool(
+    name="ynab_get_category_targets",
+    annotations={
+        "title": "Get Category Targets/Goals",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+@handle_tool_errors
+async def ynab_get_category_targets(ctx: Context) -> str:
+    """List all categories that have a target/goal set, with funding progress."""
+    ynab, _ = _get_deps(ctx)
+    groups = await ynab.get_categories()
+    return format_category_targets(groups)
+
+
+@mcp.tool(
+    name="ynab_set_category_target",
+    annotations={
+        "title": "Set Category Target/Goal",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_set_category_target(params: SetCategoryTargetInput, ctx: Context) -> str:
+    """Set, update, or remove a savings target/goal on a budget category."""
+    ynab, _ = _get_deps(ctx)
+
+    # 1. Fetch categories and resolve by name
+    groups = await ynab.get_categories()
+    cat = resolve_category(groups, params.category_name)
+
+    # 2. Re-fetch the single category to get current goal fields
+    cat_full = await ynab.get_category(cat.id)
+
+    # 3. Compute updates (pure)
+    target_milliunits = (
+        dollars_to_milliunits(params.target_amount)
+        if params.target_amount is not None
+        else None
+    )
+    updates, result = compute_category_target_updates(
+        cat_full,
+        target_amount_milliunits=target_milliunits,
+        target_date=params.target_date,
+        clear=params.clear_target,
+    )
+
+    # 4. Apply via the existing category-level PATCH endpoint
+    updated_cat = await ynab.update_category_metadata(cat.id, updates)
+
+    # 5. Enrich result with post-update goal fields from API response
+    result.goal_type = updated_cat.goal_type
+    result.percentage_complete = updated_cat.goal_percentage_complete
+    result.under_funded = (
+        milliunits_to_dollars(updated_cat.goal_under_funded)
+        if updated_cat.goal_under_funded is not None
+        else None
+    )
+
+    # 6. Format and return
+    return format_category_target_set(result)
+
+
+@mcp.tool(
+    name="ynab_create_account",
+    annotations={
+        "title": "Create Account",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_create_account(params: CreateAccountInput, ctx: Context) -> str:
+    """Create a new budget account."""
+    ynab, _ = _get_deps(ctx)
+
+    balance_milliunits = dollars_to_milliunits(params.balance)
+    account = await ynab.create_account(params.name, params.type.value, balance_milliunits)
+    return format_account_created(account.name, account.type.value, params.balance)
+
+
+@mcp.tool(
+    name="ynab_import_transactions",
+    annotations={
+        "title": "Import Bank Transactions",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_import_transactions(ctx: Context) -> str:
+    """Trigger linked account import and return newly imported transactions."""
+    ynab, _ = _get_deps(ctx)
+    transaction_ids = await ynab.import_transactions()
+    return format_import_result(transaction_ids)
+
+
+@mcp.tool(
+    name="ynab_bulk_update_transactions",
+    annotations={
+        "title": "Bulk Update Transactions",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_bulk_update_transactions(params: BulkUpdateTransactionsInput, ctx: Context) -> str:
+    """Update multiple transactions at once (category, memo, flag, cleared, approved)."""
+    ynab, _ = _get_deps(ctx)
+
+    transactions = await ynab.get_transactions()
+    groups = await ynab.get_categories()
+
+    api_updates, errors = compute_bulk_transaction_updates(
+        transactions, groups, params.updates
+    )
+
+    if api_updates:
+        await ynab.bulk_update_transactions(api_updates)
+
+    return format_bulk_update_result(len(api_updates), errors)
+
+
+@mcp.tool(
+    name="ynab_get_budget_settings",
+    annotations={
+        "title": "Budget Settings",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_get_budget_settings(ctx: Context) -> str:
+    """Get budget settings (date format, currency format)."""
+    ynab, _ = _get_deps(ctx)
+    settings = await ynab.get_budget_settings()
+    return format_budget_settings(settings)
+
+
+@mcp.tool(
+    name="ynab_get_user",
+    annotations={
+        "title": "Get User",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_get_user(ctx: Context) -> str:
+    """Get the authenticated YNAB user."""
+    ynab, _ = _get_deps(ctx)
+    user = await ynab.get_user()
+    return format_user(user)
+
+
+@mcp.tool(
+    name="ynab_get_payee_locations",
+    annotations={
+        "title": "Payee Locations",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_get_payee_locations(ctx: Context) -> str:
+    """List all payee locations (latitude/longitude)."""
+    ynab, _ = _get_deps(ctx)
+    locations = await ynab.get_payee_locations()
+    payees = await ynab.get_payees()
+    return format_payee_locations(locations, payees)
+
+
+@mcp.tool(
+    name="ynab_get_scheduled_transactions",
+    annotations={
+        "title": "List Scheduled Transactions",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_get_scheduled_transactions(ctx: Context) -> str:
+    """List all scheduled/recurring transactions."""
+    ynab, _ = _get_deps(ctx)
+    scheduled = await ynab.get_scheduled_transactions()
+    return format_scheduled_transactions(scheduled)
+
+
+@mcp.tool(
+    name="ynab_create_scheduled_transaction",
+    annotations={
+        "title": "Create Scheduled Transaction",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_create_scheduled_transaction(
+    params: CreateScheduledTransactionInput, ctx: Context
+) -> str:
+    """Create a new scheduled/recurring transaction."""
+    ynab, _ = _get_deps(ctx)
+
+    accounts = await ynab.get_accounts()
+    account = resolve_account(accounts, params.account_name)
+
+    category_id = None
+    category_name_resolved = None
+    if params.category_name:
+        groups = await ynab.get_categories()
+        cat = resolve_category(groups, params.category_name)
+        category_id = cat.id
+        category_name_resolved = cat.name
+
+    amount_milliunits = dollars_to_milliunits(-abs(params.amount))
+    if params.amount < 0:
+        amount_milliunits = dollars_to_milliunits(abs(params.amount))
+
+    payload: dict[str, Any] = {
+        "account_id": account.id,
+        "date": params.date,
+        "frequency": params.frequency.value,
+        "amount": amount_milliunits,
+        "payee_name": params.payee,
+    }
+    if category_id is not None:
+        payload["category_id"] = category_id
+    if params.memo is not None:
+        payload["memo"] = params.memo
+
+    result = await ynab.create_scheduled_transaction(payload)
+    return format_scheduled_transaction_created(
+        result, account.name, category_name_resolved
+    )
+
+
+@mcp.tool(
+    name="ynab_update_scheduled_transaction",
+    annotations={
+        "title": "Update Scheduled Transaction",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_update_scheduled_transaction(
+    params: UpdateScheduledTransactionInput, ctx: Context
+) -> str:
+    """Update a scheduled transaction's fields."""
+    ynab, _ = _get_deps(ctx)
+
+    scheduled = await ynab.get_scheduled_transactions()
+    matched = filter_scheduled_transaction_by_description(
+        scheduled, params.scheduled_transaction_description
+    )
+    if not matched:
+        return f"No scheduled transaction found matching '{params.scheduled_transaction_description}'."
+
+    # Resolve dependent values before the pure computation step
+    amount_milliunits = None
+    if params.amount is not None:
+        amount_milliunits = dollars_to_milliunits(-abs(params.amount))
+        if params.amount < 0:
+            amount_milliunits = dollars_to_milliunits(abs(params.amount))
+
+    category_id = None
+    category_name_resolved = None
+    if params.category_name is not None:
+        groups = await ynab.get_categories()
+        cat = resolve_category(groups, params.category_name)
+        category_id = cat.id
+        category_name_resolved = cat.name
+
+    payload, changes = compute_scheduled_transaction_updates(
+        matched,
+        date=params.date,
+        frequency_value=params.frequency.value if params.frequency else None,
+        amount_milliunits=amount_milliunits,
+        payee=params.payee,
+        category_id=category_id,
+        category_name=category_name_resolved,
+        memo=params.memo,
+        flag_color=params.flag_color.value if params.flag_color else None,
+    )
+
+    if not payload:
+        return (
+            f"No changes needed — the scheduled transaction for "
+            f"**{matched.payee_name or 'Unknown'}** already has those values."
+        )
+
+    await ynab.update_scheduled_transaction(matched.id, payload)
+    return format_scheduled_transaction_updated(
+        matched.payee_name or "Unknown", changes
+    )
+
+
+@mcp.tool(
+    name="ynab_delete_scheduled_transaction",
+    annotations={
+        "title": "Delete Scheduled Transaction",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_delete_scheduled_transaction(
+    params: DeleteScheduledTransactionInput, ctx: Context
+) -> str:
+    """Delete a scheduled/recurring transaction."""
+    ynab, _ = _get_deps(ctx)
+
+    scheduled = await ynab.get_scheduled_transactions()
+    matched = filter_scheduled_transaction_by_description(
+        scheduled, params.scheduled_transaction_description
+    )
+    if not matched:
+        return f"No scheduled transaction found matching '{params.scheduled_transaction_description}'."
+
+    payee = matched.payee_name or "Unknown"
+    amount = matched.amount
+    date_next = matched.date_next
+
+    await ynab.delete_scheduled_transaction(matched.id)
+    return format_scheduled_transaction_deleted(payee, amount, date_next)
+
+
+@mcp.tool(
+    name="ynab_get_payee_transactions",
+    annotations={
+        "title": "Get Payee Transactions",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+@handle_tool_errors
+async def ynab_get_payee_transactions(params: GetPayeeTransactionsInput, ctx: Context) -> str:
+    """Get transactions for a specific payee."""
+    ynab, _ = _get_deps(ctx)
+
+    payees = await ynab.get_payees()
+    matched = resolve_payee(payees, params.payee_name)
+
+    transactions = await ynab.get_payee_transactions(
+        matched.id, since_date=params.since_date
+    )
+    return format_transactions(transactions, params.limit)
 
 
 # --- Entry point ---

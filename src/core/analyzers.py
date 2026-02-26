@@ -5,25 +5,31 @@ dataclasses. No I/O — keeps business logic testable without mocking.
 """
 
 from datetime import date, timedelta
+from typing import Any
 
 from src.models.results import (
     AffordabilityResult,
     AnomalyItem,
     BudgetAssignment,
     CategoryBalance,
+    CategoryTargetResult,
     CreditCardAnalysis,
     CreditCardInfo,
+    FieldChange,
     MoveSuggestion,
     OverspendingResult,
     SplitItem,
     SpendingForecast,
     SpendingTrendResult,
 )
+from src.core.resolvers import ResolverError, resolve_category
 from src.models.schemas import (
     Account,
     AccountType,
+    BulkTransactionUpdateInput,
     Category,
     CategoryGroup,
+    ScheduledTransaction,
     Transaction,
     dollars_to_milliunits,
     milliunits_to_dollars,
@@ -115,7 +121,7 @@ def analyze_spending_trends(
 # --- Uncategorized Transaction Review ---
 
 
-def find_uncategorized_transactions(
+def filter_uncategorized_transactions(
     transactions: list[Transaction],
 ) -> list[Transaction]:
     """Filter to non-deleted transactions with no category assigned."""
@@ -123,6 +129,360 @@ def find_uncategorized_transactions(
         t for t in transactions
         if not t.deleted and t.category_id is None
     ]
+
+
+def filter_transaction_by_description(
+    transactions: list[Transaction],
+    query: str,
+) -> Transaction | None:
+    """Find a non-deleted transaction matching a search query.
+
+    Searches across payee name, memo, date, and formatted amount.
+    Returns the first match or ``None``.
+    """
+    q = query.lower()
+    if not q:
+        return None
+    for t in transactions:
+        if t.deleted:
+            continue
+        amount_str = f"{abs(milliunits_to_dollars(t.amount)):,.2f}"
+        if (
+            q in (t.payee_name or "").lower()
+            or q in (t.memo or "").lower()
+            or q in t.date
+            or q in amount_str
+        ):
+            return t
+    return None
+
+
+# --- Scheduled Transaction Lookup ---
+
+
+def filter_scheduled_transaction_by_description(
+    scheduled_transactions: list[ScheduledTransaction],
+    query: str,
+) -> ScheduledTransaction | None:
+    """Find a non-deleted scheduled transaction matching a search query.
+
+    Searches across payee name, memo, date_next, and formatted amount.
+    Returns the first match or ``None``.
+    """
+    q = query.lower()
+    if not q:
+        return None
+    for st in scheduled_transactions:
+        if st.deleted:
+            continue
+        amount_str = f"{abs(milliunits_to_dollars(st.amount)):,.2f}"
+        if (
+            q in (st.payee_name or "").lower()
+            or q in (st.memo or "").lower()
+            or q in st.date_next
+            or q in amount_str
+        ):
+            return st
+    return None
+
+
+# --- Transaction Update Builder ---
+
+
+def compute_transaction_updates(
+    transaction: Transaction,
+    *,
+    memo: str | None = None,
+    category_id: str | None = None,
+    category_name: str | None = None,
+    payee_name: str | None = None,
+    date: str | None = None,
+    amount_milliunits: int | None = None,  # milliunits
+    flag_color: str | None = None,
+    cleared: str | None = None,
+    approved: bool | None = None,
+) -> tuple[dict[str, Any], list[FieldChange]]:
+    """Build the YNAB API update payload and a list of field changes.
+
+    Only includes fields that differ from the current transaction state.
+    All parameters except *transaction* are pre-resolved values ready for
+    the API.
+
+    Returns a tuple of ``(api_updates_dict, changes_list)``.
+    """
+    updates: dict[str, Any] = {}
+    changes: list[FieldChange] = []
+
+    if memo is not None and memo != (transaction.memo or ""):
+        updates["memo"] = memo
+        changes.append(FieldChange(
+            field_name="Memo",
+            old_value=transaction.memo or "(none)",
+            new_value=memo or "(cleared)",
+        ))
+
+    if category_id is not None and category_id != transaction.category_id:
+        updates["category_id"] = category_id
+        changes.append(FieldChange(
+            field_name="Category",
+            old_value=transaction.category_name or "Uncategorized",
+            new_value=category_name or category_id,
+        ))
+
+    if payee_name is not None and payee_name != (transaction.payee_name or ""):
+        updates["payee_name"] = payee_name
+        changes.append(FieldChange(
+            field_name="Payee",
+            old_value=transaction.payee_name or "(none)",
+            new_value=payee_name,
+        ))
+
+    if date is not None and date != transaction.date:
+        updates["date"] = date
+        changes.append(FieldChange(
+            field_name="Date",
+            old_value=transaction.date,
+            new_value=date,
+        ))
+
+    if amount_milliunits is not None and amount_milliunits != transaction.amount:
+        updates["amount"] = amount_milliunits
+        old_amt = abs(milliunits_to_dollars(transaction.amount))
+        new_amt = abs(milliunits_to_dollars(amount_milliunits))
+        changes.append(FieldChange(
+            field_name="Amount",
+            old_value=f"${old_amt:,.2f}",
+            new_value=f"${new_amt:,.2f}",
+        ))
+
+    if flag_color is not None and flag_color != (
+        transaction.flag_color.value if transaction.flag_color else None
+    ):
+        updates["flag_color"] = flag_color
+        changes.append(FieldChange(
+            field_name="Flag",
+            old_value=(transaction.flag_color.value if transaction.flag_color else "(none)"),
+            new_value=flag_color,
+        ))
+
+    if cleared is not None and cleared != transaction.cleared.value:
+        updates["cleared"] = cleared
+        changes.append(FieldChange(
+            field_name="Cleared",
+            old_value=transaction.cleared.value,
+            new_value=cleared,
+        ))
+
+    if approved is not None and approved != transaction.approved:
+        updates["approved"] = approved
+        changes.append(FieldChange(
+            field_name="Approved",
+            old_value=str(transaction.approved),
+            new_value=str(approved),
+        ))
+
+    return updates, changes
+
+
+def compute_scheduled_transaction_updates(
+    scheduled: ScheduledTransaction,
+    *,
+    date: str | None = None,
+    frequency_value: str | None = None,
+    amount_milliunits: int | None = None,  # milliunits
+    payee: str | None = None,
+    category_id: str | None = None,
+    category_name: str | None = None,
+    memo: str | None = None,
+    flag_color: str | None = None,
+) -> tuple[dict[str, Any], list[FieldChange]]:
+    """Build the YNAB API update payload and a list of field changes.
+
+    Only includes fields that differ from the current scheduled transaction
+    state. All parameters except *scheduled* are pre-resolved values ready
+    for the API.
+
+    Returns a tuple of ``(api_payload_dict, changes_list)``.
+    """
+    payload: dict[str, Any] = {}
+    changes: list[FieldChange] = []
+
+    if date is not None and date != scheduled.date_next:
+        payload["date"] = date
+        changes.append(FieldChange(
+            field_name="Date",
+            old_value=scheduled.date_next,
+            new_value=date,
+        ))
+
+    if frequency_value is not None and frequency_value != scheduled.frequency.value:
+        payload["frequency"] = frequency_value
+        changes.append(FieldChange(
+            field_name="Frequency",
+            old_value=scheduled.frequency.value,
+            new_value=frequency_value,
+        ))
+
+    if amount_milliunits is not None and amount_milliunits != scheduled.amount:
+        payload["amount"] = amount_milliunits
+        old_amt = abs(milliunits_to_dollars(scheduled.amount))
+        new_amt = abs(milliunits_to_dollars(amount_milliunits))
+        changes.append(FieldChange(
+            field_name="Amount",
+            old_value=f"${old_amt:,.2f}",
+            new_value=f"${new_amt:,.2f}",
+        ))
+
+    if payee is not None and payee != (scheduled.payee_name or ""):
+        payload["payee_name"] = payee
+        changes.append(FieldChange(
+            field_name="Payee",
+            old_value=scheduled.payee_name or "Unknown",
+            new_value=payee,
+        ))
+
+    if category_id is not None and category_id != scheduled.category_id:
+        payload["category_id"] = category_id
+        changes.append(FieldChange(
+            field_name="Category",
+            old_value=scheduled.category_name or "Uncategorized",
+            new_value=category_name or category_id,
+        ))
+
+    if memo is not None and memo != (scheduled.memo or ""):
+        payload["memo"] = memo
+        changes.append(FieldChange(
+            field_name="Memo",
+            old_value=scheduled.memo or "(none)",
+            new_value=memo or "(cleared)",
+        ))
+
+    if flag_color is not None and flag_color != (
+        scheduled.flag_color.value if scheduled.flag_color else None
+    ):
+        payload["flag_color"] = flag_color
+        old_flag = scheduled.flag_color.value if scheduled.flag_color else "(none)"
+        changes.append(FieldChange(
+            field_name="Flag",
+            old_value=old_flag,
+            new_value=flag_color,
+        ))
+
+    return payload, changes
+
+
+def compute_bulk_transaction_updates(
+    transactions: list[Transaction],
+    groups: list[CategoryGroup],
+    updates: list[BulkTransactionUpdateInput],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Build merged API payloads for a bulk transaction update.
+
+    For each item in *updates*, matches the transaction by description,
+    resolves the category (if provided), builds the per-transaction update
+    dict, and deduplicates by transaction ID (later updates win).
+
+    Returns a tuple of ``(api_payloads, errors)`` where *api_payloads* is
+    the list of merged update dicts ready for the YNAB bulk API, and
+    *errors* is a list of human-readable error strings for unmatched items.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+
+    for item in updates:
+        matched = filter_transaction_by_description(transactions, item.transaction_description)
+        if not matched:
+            errors.append(f"No match for '{item.transaction_description}'")
+            continue
+
+        update: dict[str, Any] = {"id": matched.id}
+        if item.category_name:
+            try:
+                cat = resolve_category(groups, item.category_name)
+            except ResolverError:
+                errors.append(
+                    f"No category matching '{item.category_name}'"
+                    f" for '{item.transaction_description}'"
+                )
+                continue
+            update["category_id"] = cat.id
+        if item.memo is not None:
+            update["memo"] = item.memo
+        if item.flag_color is not None:
+            update["flag_color"] = item.flag_color.value
+        if item.cleared is not None:
+            update["cleared"] = item.cleared.value
+        if item.approved is not None:
+            update["approved"] = item.approved
+
+        if matched.id in merged:
+            merged[matched.id].update(update)
+        else:
+            merged[matched.id] = update
+
+    return list(merged.values()), errors
+
+
+# --- Category Target Updates ---
+
+
+def compute_category_target_updates(
+    category: Category,
+    target_amount_milliunits: int | None,
+    target_date: str | None,
+    clear: bool,
+) -> tuple[dict[str, Any], CategoryTargetResult]:
+    """Build the PATCH payload and result for setting/clearing a category target.
+
+    Pure function — no I/O.
+    """
+    old_target = (
+        milliunits_to_dollars(category.goal_target)
+        if category.goal_target is not None
+        else None
+    )
+    old_target_date = category.goal_target_date
+
+    updates: dict[str, Any] = {}
+
+    if clear:
+        updates["goal_target"] = None
+        updates["goal_target_date"] = None
+        result = CategoryTargetResult(
+            category_name=category.name,
+            action="removed",
+            new_target=None,
+            new_target_date=None,
+            old_target=old_target,
+            old_target_date=old_target_date,
+            goal_type=None,
+            percentage_complete=None,
+            under_funded=None,
+        )
+    else:
+        updates["goal_target"] = target_amount_milliunits
+        if target_date is not None:
+            updates["goal_target_date"] = target_date
+
+        action = "updated" if category.goal_target is not None else "set"
+        new_target_dollars = (
+            milliunits_to_dollars(target_amount_milliunits)
+            if target_amount_milliunits is not None
+            else None
+        )
+        result = CategoryTargetResult(
+            category_name=category.name,
+            action=action,
+            new_target=new_target_dollars,
+            new_target_date=target_date,
+            old_target=old_target,
+            old_target_date=old_target_date,
+            goal_type=None,
+            percentage_complete=None,
+            under_funded=None,
+        )
+
+    return updates, result
 
 
 # --- Cover Overspending Workflow ---

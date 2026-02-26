@@ -4,7 +4,7 @@ from datetime import date
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # --- YNAB uses "milliunits" for currency (1000 = $1.00) ---
@@ -52,6 +52,21 @@ class TransactionFlagColor(str, Enum):
     PURPLE = "purple"
 
 
+class ScheduledTransactionFrequency(str, Enum):
+    NEVER = "never"
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    EVERY_OTHER_WEEK = "everyOtherWeek"
+    TWICE_A_MONTH = "twiceAMonth"
+    EVERY_FOUR_WEEKS = "every4Weeks"
+    MONTHLY = "monthly"
+    EVERY_OTHER_MONTH = "everyOtherMonth"
+    EVERY_THREE_MONTHS = "every3Months"
+    EVERY_FOUR_MONTHS = "every4Months"
+    TWICE_A_YEAR = "twiceAYear"
+    YEARLY = "yearly"
+
+
 # --- Response Models ---
 
 class Budget(BaseModel):
@@ -95,6 +110,15 @@ class Category(BaseModel):
     hidden: bool = False
     deleted: bool = False
     note: Optional[str] = None
+    # --- Goal/target fields (read-only from API) ---
+    goal_type: str | None = None              # TB, TBD, MF, NEED, DEBT
+    goal_target: int | None = None            # milliunits
+    goal_target_date: str | None = None       # YYYY-MM-DD
+    goal_percentage_complete: int | None = None
+    goal_under_funded: int | None = None      # milliunits
+    goal_overall_funded: int | None = None    # milliunits
+    goal_months_to_budget: int | None = None
+    goal_creation_month: str | None = None
 
     @property
     def budgeted_dollars(self) -> float:
@@ -175,6 +199,82 @@ class MonthSummary(BaseModel):
     activity: int  # milliunits
     to_be_budgeted: int  # milliunits
     deleted: bool = False
+
+
+class ScheduledSubTransaction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    scheduled_transaction_id: str
+    amount: int  # milliunits
+    payee_id: str | None = None
+    payee_name: str | None = None
+    category_id: str | None = None
+    category_name: str | None = None
+    memo: str | None = None
+    deleted: bool = False
+
+
+class ScheduledTransaction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    date_first: str
+    date_next: str
+    frequency: ScheduledTransactionFrequency
+    amount: int  # milliunits
+    account_id: str
+    account_name: str | None = None
+    payee_id: str | None = None
+    payee_name: str | None = None
+    category_id: str | None = None
+    category_name: str | None = None
+    memo: str | None = None
+    flag_color: TransactionFlagColor | None = None
+    subtransactions: list[ScheduledSubTransaction] = []
+    deleted: bool = False
+
+    @property
+    def amount_dollars(self) -> float:
+        return milliunits_to_dollars(self.amount)
+
+
+class PayeeLocation(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    payee_id: str
+    latitude: str
+    longitude: str
+    deleted: bool = False
+
+
+class DateFormat(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    format: str
+
+
+class CurrencyFormat(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    iso_code: str
+    example_format: str
+    decimal_digits: int
+    decimal_separator: str
+    symbol_first: bool
+    group_separator: str
+    currency_symbol: str
+    display_symbol: bool
+
+
+class BudgetSettings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    date_format: DateFormat
+    currency_format: CurrencyFormat
+
+
+class User(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
 
 
 # --- Input Models for Creating/Updating ---
@@ -292,9 +392,68 @@ class CategorizeTransactionInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     transaction_description: str = Field(
-        ..., description="Payee name, date, or amount to identify the transaction"
+        ..., min_length=1, description="Payee name, date, or amount to identify the transaction"
     )
     category_name: str = Field(..., description="Category to assign")
+
+
+class RecategorizeTransactionInput(BaseModel):
+    """Input for changing the category of any transaction (including already-categorized ones)."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    transaction_description: str = Field(
+        ..., min_length=1, description="Payee name, date, or amount to identify the transaction"
+    )
+    new_category_name: str = Field(
+        ..., description="New category to assign (use 'Inflow: Ready to Assign' for income)"
+    )
+
+
+class UpdateTransactionInput(BaseModel):
+    """Input for updating any editable field on an existing transaction."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    transaction_description: str = Field(
+        ..., min_length=1, description="Payee name, date, or amount to identify the transaction to update"
+    )
+    memo: str | None = Field(
+        None, description="New memo text (set to empty string to clear)", max_length=200
+    )
+    category_name: str | None = Field(
+        None, description="New category name (use 'Inflow: Ready to Assign' for income)"
+    )
+    payee: str | None = Field(
+        None, description="New payee name", max_length=200
+    )
+    date: str | None = Field(
+        None, description="New transaction date (YYYY-MM-DD)"
+    )
+    amount: float | None = Field(
+        None, description="New dollar amount (positive for outflow, negative for inflow/refund)"
+    )
+    flag_color: TransactionFlagColor | None = Field(
+        None, description="Flag color: red, orange, yellow, green, blue, purple"
+    )
+    cleared: TransactionClearedStatus | None = Field(
+        None, description="Cleared status: cleared, uncleared, reconciled"
+    )
+    approved: bool | None = Field(
+        None, description="Whether the transaction is approved (imported transactions start unapproved)"
+    )
+
+    @model_validator(mode="after")
+    def _at_least_one_update_field(self) -> "UpdateTransactionInput":
+        update_fields = [
+            self.memo, self.category_name, self.payee,
+            self.date, self.amount, self.flag_color, self.cleared,
+            self.approved,
+        ]
+        if all(f is None for f in update_fields):
+            raise ValueError(
+                "At least one field to update must be provided "
+                "(memo, category_name, payee, date, amount, flag_color, cleared, approved)"
+            )
+        return self
 
 
 class AffordabilityCheckInput(BaseModel):
@@ -343,3 +502,186 @@ class SpendingForecastInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     category_name: str = Field(..., description="Category to forecast")
+
+
+class DeleteTransactionInput(BaseModel):
+    """Input for deleting a transaction."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    transaction_description: str = Field(
+        ..., min_length=1, description="Payee name, date, or amount to identify the transaction to delete"
+    )
+
+
+class UpdatePayeeInput(BaseModel):
+    """Input for renaming a payee."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    payee_name: str = Field(..., description="Current payee name (partial match)")
+    new_name: str = Field(..., description="New name for the payee", max_length=500)
+
+
+class UpdateCategoryMetadataInput(BaseModel):
+    """Input for updating a category's name or note."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    category_name: str = Field(..., description="Current category name (partial match)")
+    new_name: str | None = Field(None, description="New name for the category")
+    note: str | None = Field(
+        None, description="New note for the category (set to empty string to clear)"
+    )
+
+    @model_validator(mode="after")
+    def _at_least_one_field(self) -> "UpdateCategoryMetadataInput":
+        if self.new_name is None and self.note is None:
+            raise ValueError("At least one of new_name or note must be provided")
+        return self
+
+
+class SetCategoryTargetInput(BaseModel):
+    """Input for setting or removing a category's savings target/goal."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    category_name: str = Field(..., description="Category name (partial match)")
+    target_amount: float | None = Field(
+        None,
+        description="Target amount in dollars. Creates a 'Needed for Spending' goal. "
+        "Omit and set clear_target=true to remove an existing target.",
+        gt=0,
+    )
+    target_date: str | None = Field(
+        None,
+        description="Optional target date (YYYY-MM-DD, first of month). "
+        "If provided with target_amount, creates a 'Target by Date' goal.",
+    )
+    clear_target: bool = Field(
+        default=False,
+        description="Set to true to remove the existing target/goal from this category.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_target_or_clear(self) -> "SetCategoryTargetInput":
+        if self.clear_target and self.target_amount is not None:
+            raise ValueError(
+                "Cannot set both target_amount and clear_target=true. "
+                "Use target_amount to set a goal, or clear_target=true to remove one."
+            )
+        if not self.clear_target and self.target_amount is None:
+            raise ValueError(
+                "Either target_amount must be provided, or clear_target must be true."
+            )
+        if self.target_date is not None and self.target_amount is None:
+            raise ValueError(
+                "target_date requires target_amount to also be provided."
+            )
+        return self
+
+
+class CreateAccountInput(BaseModel):
+    """Input for creating a new budget account."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    name: str = Field(..., description="Account name")
+    type: AccountType = Field(..., description="Account type (checking, savings, creditCard, etc.)")
+    balance: float = Field(default=0.0, description="Starting balance in dollars")
+
+
+class BulkTransactionUpdateInput(BaseModel):
+    """A single transaction update within a bulk operation."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    transaction_description: str = Field(
+        ..., min_length=1, description="Payee name, date, or amount to identify the transaction"
+    )
+    category_name: str | None = Field(None, description="New category name")
+    memo: str | None = Field(None, description="New memo")
+    flag_color: TransactionFlagColor | None = Field(None, description="New flag color")
+    cleared: TransactionClearedStatus | None = Field(None, description="New cleared status")
+    approved: bool | None = Field(
+        None, description="Whether the transaction is approved (imported transactions start unapproved)"
+    )
+
+    @model_validator(mode="after")
+    def _at_least_one_update_field(self) -> "BulkTransactionUpdateInput":
+        update_fields = [
+            self.category_name, self.memo, self.flag_color,
+            self.cleared, self.approved,
+        ]
+        if all(f is None for f in update_fields):
+            raise ValueError(
+                "At least one field to update must be provided "
+                "(category_name, memo, flag_color, cleared, approved)"
+            )
+        return self
+
+
+class BulkUpdateTransactionsInput(BaseModel):
+    """Input for updating multiple transactions at once."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    updates: list[BulkTransactionUpdateInput] = Field(
+        ..., description="List of transaction updates", min_length=1, max_length=50
+    )
+
+
+class GetPayeeTransactionsInput(BaseModel):
+    """Input for getting transactions for a specific payee."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    payee_name: str = Field(..., description="Payee name (partial match)")
+    since_date: str | None = Field(None, description="Start date (YYYY-MM-DD)")
+    limit: int = Field(default=25, ge=1, le=100, description="Max results")
+
+
+class CreateScheduledTransactionInput(BaseModel):
+    """Input for creating a scheduled/recurring transaction."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    account_name: str | None = Field(
+        None, description="Account name. Defaults to first checking account."
+    )
+    date: str = Field(
+        ..., description="First date for the scheduled transaction (YYYY-MM-DD, must be future)"
+    )
+    frequency: ScheduledTransactionFrequency = Field(
+        ..., description="How often the transaction repeats"
+    )
+    amount: float = Field(
+        ..., description="Dollar amount (positive for outflow, negative for inflow)"
+    )
+    payee: str = Field(..., description="Payee name")
+    category_name: str | None = Field(None, description="Category name (partial match)")
+    memo: str | None = Field(None, description="Transaction memo", max_length=500)
+
+
+class UpdateScheduledTransactionInput(BaseModel):
+    """Input for updating a scheduled transaction."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    scheduled_transaction_description: str = Field(
+        ..., min_length=1, description="Payee name, date, or amount to identify the scheduled transaction"
+    )
+    date: str | None = Field(None, description="New next date (YYYY-MM-DD)")
+    frequency: ScheduledTransactionFrequency | None = Field(None, description="New frequency")
+    amount: float | None = Field(None, description="New dollar amount")
+    payee: str | None = Field(None, description="New payee name")
+    category_name: str | None = Field(None, description="New category name")
+    memo: str | None = Field(None, description="New memo")
+    flag_color: TransactionFlagColor | None = Field(None, description="New flag color")
+
+    @model_validator(mode="after")
+    def _at_least_one_field(self) -> "UpdateScheduledTransactionInput":
+        fields = [self.date, self.frequency, self.amount, self.payee,
+                  self.category_name, self.memo, self.flag_color]
+        if all(f is None for f in fields):
+            raise ValueError("At least one field to update must be provided")
+        return self
+
+
+class DeleteScheduledTransactionInput(BaseModel):
+    """Input for deleting a scheduled transaction."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    scheduled_transaction_description: str = Field(
+        ..., min_length=1, description="Payee name, date, or amount to identify the scheduled transaction"
+    )

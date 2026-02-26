@@ -8,17 +8,25 @@ from __future__ import annotations
 from src.models.results import (
     AffordabilityResult,
     BudgetAssignment,
+    CategoryTargetResult,
     CreditCardAnalysis,
+    FieldChange,
     OverspendingResult,
     SpendingForecast,
     SpendingTrendResult,
+    TransactionUpdateResult,
 )
 from src.models.schemas import (
     Budget,
     Account,
+    BudgetSettings,
     Category,
     CategoryGroup,
+    Payee,
+    PayeeLocation,
+    ScheduledTransaction,
     Transaction,
+    User,
     milliunits_to_dollars,
 )
 
@@ -101,11 +109,13 @@ def format_transactions(transactions: list[Transaction], limit: int) -> str:
     for t in filtered:
         amount = milliunits_to_dollars(t.amount)
         direction = "IN" if amount > 0 else "OUT"
+        status = "✓" if t.approved else "⏳"
         lines.append(
             f"- {t.date} [{direction}] **${abs(amount):,.2f}** "
             f"| {t.payee_name or 'Unknown'} "
             f"| {t.category_name or 'Uncategorized'} "
-            f"| {t.account_name or ''}"
+            f"| {t.account_name or ''} "
+            f"| {status}"
         )
         if t.memo:
             lines.append(f"  _Memo: {t.memo}_")
@@ -254,6 +264,32 @@ def format_transaction_categorized(payee: str, amount_milliunits: int, new_categ
         f"Categorized **${abs(amt):,.2f}** at **{payee}** "
         f"as **{new_category}**."
     )
+
+
+def format_transaction_recategorized(
+    payee: str,
+    amount_milliunits: int,
+    old_category: str | None,
+    new_category: str,
+) -> str:
+    """Confirmation after recategorizing a transaction."""
+    amt = milliunits_to_dollars(amount_milliunits)
+    old = old_category or "Uncategorized"
+    return (
+        f"Recategorized **${abs(amt):,.2f}** at **{payee}**: "
+        f"{old} → **{new_category}**."
+    )
+
+
+def format_transaction_updated(result: TransactionUpdateResult) -> str:
+    """Confirmation after updating transaction fields."""
+    amt = milliunits_to_dollars(result.amount_milliunits)
+    lines = [
+        f"Updated **${abs(amt):,.2f}** at **{result.payee_name}** ({result.date})\n",
+    ]
+    for change in result.changes:
+        lines.append(f"- **{change.field_name}:** {change.old_value} → {change.new_value}")
+    return "\n".join(lines)
 
 
 def format_overspending_analysis(result: OverspendingResult) -> str:
@@ -412,3 +448,274 @@ def format_spending_forecast(result: SpendingForecast) -> str:
         f"\n**Status:** {verdict.capitalize()}",
     ]
     return "\n".join(lines)
+
+
+# --- New API Feature Formatters ---
+
+
+def format_payees(payees: list[Payee]) -> str:
+    """Alphabetically sorted list of active payees."""
+    active = [p for p in payees if not p.deleted]
+    active.sort(key=lambda p: p.name.lower())
+    if not active:
+        return "No payees found."
+    lines = [f"## Payees ({len(active)})\n"]
+    for p in active:
+        lines.append(f"- {p.name}")
+    return "\n".join(lines)
+
+
+def format_transaction_deleted(payee: str, amount_milliunits: int, txn_date: str) -> str:
+    """Confirmation after deleting a transaction."""
+    amt = milliunits_to_dollars(amount_milliunits)
+    return (
+        f"Deleted **${abs(amt):,.2f}** at **{payee}** ({txn_date})."
+    )
+
+
+def format_payee_updated(old_name: str, new_name: str) -> str:
+    """Confirmation after renaming a payee."""
+    return f"Renamed payee **{old_name}** → **{new_name}**."
+
+
+def format_category_metadata_updated(
+    name: str,
+    old_name: str | None = None,
+    new_name: str | None = None,
+    old_note: str | None = None,
+    new_note: str | None = None,
+) -> str:
+    """Confirmation after updating category name/note."""
+    lines = [f"Updated category **{name}**:\n"]
+    if new_name is not None:
+        lines.append(f"- **Name:** {old_name or name} → {new_name}")
+    if new_note is not None:
+        old = old_note or "(none)"
+        new = new_note or "(cleared)"
+        lines.append(f"- **Note:** {old} → {new}")
+    return "\n".join(lines)
+
+
+_GOAL_TYPE_LABELS = {
+    "TB": "Target Balance",
+    "TBD": "Target Balance by Date",
+    "MF": "Monthly Funding",
+    "NEED": "Needed for Spending",
+    "DEBT": "Debt Payment",
+}
+
+
+def format_category_targets(groups: list[CategoryGroup]) -> str:
+    """List all categories that have a target/goal set, grouped by category group."""
+    lines = ["## Category Targets\n"]
+    total_target = 0.0
+    total_underfunded = 0.0
+    count = 0
+
+    for group in groups:
+        if group.hidden or group.deleted:
+            continue
+        if group.name in ("Internal Master Category", "Hidden Categories"):
+            continue
+
+        cats_with_targets = [
+            c for c in group.categories
+            if not c.hidden and not c.deleted and c.goal_type is not None
+        ]
+        if not cats_with_targets:
+            continue
+
+        lines.append(f"\n### {group.name}")
+        for cat in cats_with_targets:
+            count += 1
+            goal_label = _GOAL_TYPE_LABELS.get(cat.goal_type or "", cat.goal_type or "")
+            target_dollars = (
+                milliunits_to_dollars(cat.goal_target) if cat.goal_target else 0.0
+            )
+            total_target += target_dollars
+            underfunded = (
+                milliunits_to_dollars(cat.goal_under_funded)
+                if cat.goal_under_funded
+                else 0.0
+            )
+            total_underfunded += underfunded
+            pct = cat.goal_percentage_complete or 0
+
+            parts = [f"  - **{cat.name}**: ${target_dollars:,.2f} ({goal_label})"]
+            parts.append(f"— {pct}% funded")
+            if underfunded > 0.005:
+                parts.append(f"| ${underfunded:,.2f} underfunded")
+            if cat.goal_target_date:
+                parts.append(f"| by {cat.goal_target_date}")
+            lines.append(" ".join(parts))
+
+    if count == 0:
+        return "No category targets/goals found."
+
+    lines.append("\n---")
+    lines.append(f"**{count} categories with targets**")
+    lines.append(f"**Total target amount:** ${total_target:,.2f}")
+    if total_underfunded > 0.005:
+        lines.append(f"**Total underfunded:** ${total_underfunded:,.2f}")
+
+    return "\n".join(lines)
+
+
+def format_category_target_set(result: CategoryTargetResult) -> str:
+    """Confirmation after setting or removing a category target."""
+    if result.action == "removed":
+        lines = [f"Target removed from **{result.category_name}**."]
+        if result.old_target is not None:
+            lines.append(f"- **Previous target:** ${result.old_target:,.2f}")
+            if result.old_target_date:
+                lines.append(f"- **Previous target date:** {result.old_target_date}")
+        return "\n".join(lines)
+
+    verb = "Target set" if result.action == "set" else "Target updated"
+    lines = [f"{verb} for **{result.category_name}**:\n"]
+
+    if result.old_target is not None:
+        lines.append(f"- **Previous target:** ${result.old_target:,.2f}")
+    if result.new_target is not None:
+        lines.append(f"- **New target:** ${result.new_target:,.2f}")
+    if result.new_target_date:
+        lines.append(f"- **Target date:** {result.new_target_date}")
+    if result.goal_type:
+        lines.append(f"- **Goal type:** {result.goal_type}")
+    if result.percentage_complete is not None:
+        lines.append(f"- **Progress:** {result.percentage_complete}% complete")
+    if result.under_funded is not None and result.under_funded > 0.005:
+        lines.append(f"- **Under-funded:** ${result.under_funded:,.2f}")
+
+    return "\n".join(lines)
+
+
+def format_account_created(name: str, type_: str, balance: float) -> str:
+    """Confirmation after creating a new account."""
+    return (
+        f"Account created!\n\n"
+        f"- **Name:** {name}\n"
+        f"- **Type:** {type_}\n"
+        f"- **Balance:** ${balance:,.2f}"
+    )
+
+
+def format_import_result(transaction_ids: list[str]) -> str:
+    """Summary after triggering a bank import."""
+    count = len(transaction_ids)
+    if count == 0:
+        return "Import complete — no new transactions found."
+    return f"Imported **{count}** new transaction{'s' if count != 1 else ''}."
+
+
+def format_bulk_update_result(count: int, errors: list[str]) -> str:
+    """Summary of a bulk transaction update."""
+    lines = [f"Updated **{count}** transaction{'s' if count != 1 else ''}."]
+    if errors:
+        lines.append(f"\n**Errors ({len(errors)}):**")
+        for err in errors:
+            lines.append(f"- {err}")
+    return "\n".join(lines)
+
+
+def format_budget_settings(settings: BudgetSettings) -> str:
+    """Display budget date and currency format settings."""
+    cf = settings.currency_format
+    return (
+        f"## Budget Settings\n\n"
+        f"- **Date format:** {settings.date_format.format}\n"
+        f"- **Currency:** {cf.currency_symbol} ({cf.iso_code})\n"
+        f"- **Example:** {cf.example_format}\n"
+        f"- **Decimal digits:** {cf.decimal_digits}"
+    )
+
+
+def format_user(user: User) -> str:
+    """Display the authenticated user."""
+    return f"Authenticated as user `{user.id}`."
+
+
+def format_payee_locations(
+    locations: list[PayeeLocation],
+    payees: list[Payee],
+) -> str:
+    """List payee locations with payee names."""
+    active = [loc for loc in locations if not loc.deleted]
+    if not active:
+        return "No payee locations found."
+
+    payee_map = {p.id: p.name for p in payees}
+    lines = [f"## Payee Locations ({len(active)})\n"]
+    for loc in active:
+        name = payee_map.get(loc.payee_id, "Unknown")
+        lines.append(f"- **{name}**: ({loc.latitude}, {loc.longitude})")
+    return "\n".join(lines)
+
+
+def format_scheduled_transactions(scheduled: list[ScheduledTransaction]) -> str:
+    """List scheduled transactions sorted by next date."""
+    active = [st for st in scheduled if not st.deleted]
+    active.sort(key=lambda st: st.date_next)
+
+    if not active:
+        return "No scheduled transactions found."
+
+    lines = [f"## Scheduled Transactions ({len(active)})\n"]
+    for st in active:
+        amt = milliunits_to_dollars(st.amount)
+        direction = "IN" if amt > 0 else "OUT"
+        freq = st.frequency.value
+        lines.append(
+            f"- {st.date_next} [{direction}] **${abs(amt):,.2f}** "
+            f"| {st.payee_name or 'Unknown'} "
+            f"| {st.category_name or 'Uncategorized'} "
+            f"| {freq}"
+        )
+        if st.memo:
+            lines.append(f"  _Memo: {st.memo}_")
+    return "\n".join(lines)
+
+
+def format_scheduled_transaction_created(
+    st: ScheduledTransaction,
+    account_name: str,
+    category_name: str | None,
+) -> str:
+    """Confirmation after creating a scheduled transaction."""
+    amt = milliunits_to_dollars(st.amount)
+    lines = [
+        "Scheduled transaction created!\n",
+        f"- **Amount:** ${abs(amt):,.2f} {'inflow' if amt > 0 else 'outflow'}",
+        f"- **Payee:** {st.payee_name or 'Unknown'}",
+        f"- **Category:** {category_name or 'Uncategorized'}",
+        f"- **Account:** {account_name}",
+        f"- **First date:** {st.date_first}",
+        f"- **Frequency:** {st.frequency.value}",
+    ]
+    if st.memo:
+        lines.append(f"- **Memo:** {st.memo}")
+    return "\n".join(lines)
+
+
+def format_scheduled_transaction_updated(
+    payee: str,
+    changes: list[FieldChange],
+) -> str:
+    """Confirmation after updating a scheduled transaction."""
+    lines = [f"Updated scheduled transaction for **{payee}**:\n"]
+    for change in changes:
+        lines.append(f"- **{change.field_name}:** {change.old_value} → {change.new_value}")
+    return "\n".join(lines)
+
+
+def format_scheduled_transaction_deleted(
+    payee: str,
+    amount_milliunits: int,
+    date_next: str,
+) -> str:
+    """Confirmation after deleting a scheduled transaction."""
+    amt = milliunits_to_dollars(amount_milliunits)
+    return (
+        f"Deleted scheduled transaction: **${abs(amt):,.2f}** "
+        f"at **{payee}** (next: {date_next})."
+    )

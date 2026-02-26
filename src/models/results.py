@@ -113,3 +113,34 @@ class SpendingForecast:
     projected_total: float     # dollars projected spend
     will_stay_in_budget: bool
     projected_remaining: float # dollars (negative = over budget)
+
+
+@dataclass
+class CategoryTargetResult:
+    """Result of setting or removing a category target."""
+    category_name: str
+    action: str                    # "set", "updated", or "removed"
+    new_target: float | None       # dollars, or None if removed
+    new_target_date: str | None
+    old_target: float | None       # dollars, or None if no previous goal
+    old_target_date: str | None
+    goal_type: str | None
+    percentage_complete: int | None
+    under_funded: float | None     # dollars, or None
+
+
+@dataclass
+class FieldChange:
+    """A single field that was changed on a transaction."""
+    field_name: str
+    old_value: str   # display-formatted
+    new_value: str   # display-formatted
+
+
+@dataclass
+class TransactionUpdateResult:
+    """Result of updating a transaction's fields."""
+    payee_name: str
+    amount_milliunits: int   # milliunits
+    date: str
+    changes: list[FieldChange] = field(default_factory=list)

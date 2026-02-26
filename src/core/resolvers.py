@@ -6,7 +6,7 @@ to YNAB domain objects. No I/O — they operate on already-fetched data.
 
 from __future__ import annotations
 
-from src.models.schemas import Account, Category, CategoryGroup
+from src.models.schemas import Account, Category, CategoryGroup, Payee
 
 
 class ResolverError(Exception):
@@ -77,3 +77,46 @@ def resolve_category(
             if name.lower() in cat.name.lower() and not cat.hidden and not cat.deleted:
                 return cat
     raise ResolverError("category", name)
+
+
+def resolve_category_or_inflow(
+    groups: list[CategoryGroup],
+    name: str,
+) -> Category:
+    """Resolve a category by name, including the special "Inflow: Ready to Assign" category.
+
+    Unlike :func:`resolve_category`, this also searches the
+    ``Internal Master Category`` group for the inflow category so that
+    income transactions can be categorized.
+
+    Raises :class:`ResolverError` if nothing matches.
+    """
+    _inflow_name = "Inflow: Ready to Assign"
+    _inflow_aliases = {"inflow", "inflow: ready to assign", "ready to assign"}
+    if name.strip().lower() in _inflow_aliases:
+        for group in groups:
+            for cat in group.categories:
+                if cat.name == _inflow_name and not cat.deleted:
+                    return cat
+
+    # Fall back to standard resolution for regular categories
+    return resolve_category(groups, name)
+
+
+def resolve_payee(
+    payees: list[Payee],
+    name: str,
+) -> Payee:
+    """Find a payee by name (partial, case-insensitive).
+
+    Skips deleted payees.  Raises :class:`ResolverError` if nothing matches.
+    """
+    active = [p for p in payees if not p.deleted]
+    for p in active:
+        if name.lower() in p.name.lower():
+            return p
+    raise ResolverError(
+        "payee",
+        name,
+        available=[p.name for p in active[:20]],
+    )

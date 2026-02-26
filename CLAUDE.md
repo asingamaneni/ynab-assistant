@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-YNAB Personal Assistant — a Python MCP server exposing YNAB budget management as 17+ tools for Claude Desktop/Code. Built with FastMCP, httpx, and Pydantic v2.
+YNAB Personal Assistant — a Python MCP server exposing YNAB budget management as 37 tools for Claude Desktop/Code. Built with FastMCP, httpx, and Pydantic v2.
 
 ## Quick Reference
 
@@ -42,7 +42,7 @@ To register this MCP server, add the following to your config:
 }
 ```
 
-The server registers as `ynab_mcp` via FastMCP. All 17 tools will appear prefixed with `ynab_` (e.g., `ynab_get_accounts`, `ynab_add_transaction`).
+The server registers as `ynab_mcp` via FastMCP. All 37 tools will appear prefixed with `ynab_` (e.g., `ynab_get_accounts`, `ynab_add_transaction`).
 
 ## Architecture
 

@@ -157,3 +157,178 @@ class TestErrorHandling:
             await client.get_accounts()
         assert exc_info.value.status_code == 408
         assert "timed out" in exc_info.value.detail.lower()
+
+
+class TestDeleteTransaction:
+    async def test_deletes_transaction(self, mock_client):
+        def handler(request):
+            assert request.method == "DELETE"
+            assert "/transactions/t1" in str(request.url)
+            return httpx.Response(200, json={"data": {}})
+
+        client = await mock_client(handler)
+        await client.delete_transaction("t1")
+
+
+class TestGetPayees:
+    async def test_returns_parsed_payees(self, mock_client):
+        def handler(request):
+            return httpx.Response(200, json={
+                "data": {
+                    "payees": [
+                        {"id": "p1", "name": "HEB", "deleted": False},
+                        {"id": "p2", "name": "Costco", "deleted": False},
+                    ],
+                    "server_knowledge": 10,
+                },
+            })
+
+        client = await mock_client(handler)
+        payees = await client.get_payees()
+        assert len(payees) == 2
+        assert payees[0].name == "HEB"
+
+
+class TestUpdatePayee:
+    async def test_renames_payee(self, mock_client):
+        def handler(request):
+            assert request.method == "PATCH"
+            return httpx.Response(200, json={
+                "data": {"payee": {"id": "p1", "name": "H-E-B", "deleted": False}},
+            })
+
+        client = await mock_client(handler)
+        payee = await client.update_payee("p1", "H-E-B")
+        assert payee.name == "H-E-B"
+
+
+class TestCreateAccount:
+    async def test_creates_account(self, mock_client):
+        def handler(request):
+            assert request.method == "POST"
+            return httpx.Response(201, json={
+                "data": {
+                    "account": {
+                        "id": "a-new",
+                        "name": "Savings",
+                        "type": "savings",
+                        "on_budget": True,
+                        "closed": False,
+                        "balance": 100000,
+                        "cleared_balance": 100000,
+                        "uncleared_balance": 0,
+                    },
+                },
+            })
+
+        client = await mock_client(handler)
+        account = await client.create_account("Savings", "savings", 100000)
+        assert account.name == "Savings"
+        assert account.balance == 100000
+
+
+class TestImportTransactions:
+    async def test_returns_imported_ids(self, mock_client):
+        def handler(request):
+            assert request.method == "POST"
+            return httpx.Response(200, json={
+                "data": {"transaction_ids": ["t1", "t2"]},
+            })
+
+        client = await mock_client(handler)
+        ids = await client.import_transactions()
+        assert ids == ["t1", "t2"]
+
+
+class TestBulkUpdateTransactions:
+    async def test_updates_multiple(self, mock_client):
+        def handler(request):
+            assert request.method == "PATCH"
+            return httpx.Response(200, json={
+                "data": {
+                    "transactions": [
+                        {
+                            "id": "t1", "date": "2025-01-15", "amount": -10000,
+                            "account_id": "a1", "cleared": "uncleared",
+                            "approved": True, "deleted": False, "subtransactions": [],
+                        },
+                    ],
+                },
+            })
+
+        client = await mock_client(handler)
+        results = await client.bulk_update_transactions([{"id": "t1", "memo": "updated"}])
+        assert len(results) == 1
+
+
+class TestGetBudgetSettings:
+    async def test_returns_settings(self, mock_client):
+        def handler(request):
+            return httpx.Response(200, json={
+                "data": {
+                    "settings": {
+                        "date_format": {"format": "MM/DD/YYYY"},
+                        "currency_format": {
+                            "iso_code": "USD",
+                            "example_format": "$1,234.56",
+                            "decimal_digits": 2,
+                            "decimal_separator": ".",
+                            "symbol_first": True,
+                            "group_separator": ",",
+                            "currency_symbol": "$",
+                            "display_symbol": True,
+                        },
+                    },
+                },
+            })
+
+        client = await mock_client(handler)
+        settings = await client.get_budget_settings()
+        assert settings.currency_format.iso_code == "USD"
+
+
+class TestGetUser:
+    async def test_returns_user(self, mock_client):
+        def handler(request):
+            return httpx.Response(200, json={
+                "data": {"user": {"id": "user-123"}},
+            })
+
+        client = await mock_client(handler)
+        user = await client.get_user()
+        assert user.id == "user-123"
+
+
+class TestGetScheduledTransactions:
+    async def test_returns_scheduled_list(self, mock_client):
+        def handler(request):
+            return httpx.Response(200, json={
+                "data": {
+                    "scheduled_transactions": [{
+                        "id": "st1",
+                        "date_first": "2025-01-01",
+                        "date_next": "2025-02-01",
+                        "frequency": "monthly",
+                        "amount": -15990,
+                        "account_id": "a1",
+                        "deleted": False,
+                        "subtransactions": [],
+                    }],
+                },
+            })
+
+        client = await mock_client(handler)
+        scheduled = await client.get_scheduled_transactions()
+        assert len(scheduled) == 1
+        assert scheduled[0].frequency.value == "monthly"
+
+
+class TestDeleteScheduledTransaction:
+    async def test_deletes_scheduled(self, mock_client):
+        def handler(request):
+            assert request.method == "DELETE"
+            assert "/scheduled_transactions/st1" in str(request.url)
+            return httpx.Response(200, json={"data": {}})
+
+        client = await mock_client(handler)
+        await client.delete_scheduled_transaction("st1")

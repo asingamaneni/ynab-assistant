@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from tests.conftest import make_account, make_category, make_category_group, make_transaction
+from tests.conftest import make_account, make_category, make_category_group, make_scheduled_transaction, make_transaction
 from src.core.analyzers import (
     analyze_credit_cards,
     analyze_overspending,
@@ -12,13 +12,19 @@ from src.core.analyzers import (
     build_subtransactions,
     check_affordability,
     compute_budget_assignments,
+    compute_bulk_transaction_updates,
+    compute_category_target_updates,
+    compute_scheduled_transaction_updates,
+    compute_transaction_updates,
+    filter_scheduled_transaction_by_description,
+    filter_transaction_by_description,
     filter_transactions,
-    find_uncategorized_transactions,
+    filter_uncategorized_transactions,
     forecast_spending,
     validate_split_amounts,
 )
-from src.models.results import SplitItem
-from src.models.schemas import dollars_to_milliunits
+from src.models.results import FieldChange, SplitItem
+from src.models.schemas import BulkTransactionUpdateInput, TransactionFlagColor, dollars_to_milliunits
 
 
 # --- Spending Trend Analysis ---
@@ -99,7 +105,7 @@ class TestFindUncategorizedTransactions:
             make_transaction(category_id=None, category_name=None),
             make_transaction(category_id="cat-1", category_name="Groceries"),
         ]
-        result = find_uncategorized_transactions(txns)
+        result = filter_uncategorized_transactions(txns)
         assert len(result) == 1
         assert result[0].category_id is None
 
@@ -107,11 +113,53 @@ class TestFindUncategorizedTransactions:
         txns = [
             make_transaction(category_id=None, category_name=None, deleted=True),
         ]
-        result = find_uncategorized_transactions(txns)
+        result = filter_uncategorized_transactions(txns)
         assert len(result) == 0
 
     def test_empty_list(self):
-        assert find_uncategorized_transactions([]) == []
+        assert filter_uncategorized_transactions([]) == []
+
+
+class TestFindTransactionByDescription:
+    def test_matches_by_payee(self):
+        txns = [
+            make_transaction(payee_name="Walmart", amount=-174010),
+            make_transaction(payee_name="HEB", amount=-45000),
+        ]
+        result = filter_transaction_by_description(txns, "walmart")
+        assert result is not None
+        assert result.payee_name == "Walmart"
+
+    def test_matches_by_memo(self):
+        txns = [make_transaction(memo="Monthly CC payment")]
+        result = filter_transaction_by_description(txns, "cc payment")
+        assert result is not None
+
+    def test_matches_by_date(self):
+        txns = [make_transaction(date="2025-01-15")]
+        result = filter_transaction_by_description(txns, "2025-01-15")
+        assert result is not None
+
+    def test_matches_by_amount(self):
+        txns = [make_transaction(amount=-174010)]
+        result = filter_transaction_by_description(txns, "174.01")
+        assert result is not None
+
+    def test_skips_deleted(self):
+        txns = [make_transaction(payee_name="Walmart", deleted=True)]
+        result = filter_transaction_by_description(txns, "walmart")
+        assert result is None
+
+    def test_returns_none_when_no_match(self):
+        txns = [make_transaction(payee_name="HEB")]
+        result = filter_transaction_by_description(txns, "costco")
+        assert result is None
+
+    def test_finds_categorized_transactions(self):
+        txns = [make_transaction(payee_name="Vanguard", category_id="cat-1", category_name="Business")]
+        result = filter_transaction_by_description(txns, "vanguard")
+        assert result is not None
+        assert result.category_name == "Business"
 
 
 # --- Cover Overspending ---
@@ -462,3 +510,322 @@ class TestForecastSpending:
         ]
         result = forecast_spending(cat, txns, reference_date=date(2025, 3, 10))
         assert result.spent_so_far == 50.0  # only outflow counts
+
+
+# --- Transaction Update Builder ---
+
+
+class TestBuildTransactionUpdates:
+    def test_updates_memo(self):
+        txn = make_transaction(memo="old memo")
+        updates, changes = compute_transaction_updates(txn, memo="new memo")
+        assert updates == {"memo": "new memo"}
+        assert len(changes) == 1
+        assert changes[0].field_name == "Memo"
+        assert changes[0].old_value == "old memo"
+        assert changes[0].new_value == "new memo"
+
+    def test_clears_memo_with_empty_string(self):
+        txn = make_transaction(memo="some memo")
+        updates, changes = compute_transaction_updates(txn, memo="")
+        assert updates == {"memo": ""}
+        assert changes[0].new_value == "(cleared)"
+
+    def test_adds_memo_when_none(self):
+        txn = make_transaction(memo=None)
+        updates, changes = compute_transaction_updates(txn, memo="new note")
+        assert updates == {"memo": "new note"}
+        assert changes[0].old_value == "(none)"
+
+    def test_updates_category(self):
+        txn = make_transaction(category_id="cat-groceries", category_name="Groceries")
+        updates, changes = compute_transaction_updates(
+            txn, category_id="cat-dining", category_name="Dining"
+        )
+        assert updates == {"category_id": "cat-dining"}
+        assert changes[0].field_name == "Category"
+        assert changes[0].old_value == "Groceries"
+        assert changes[0].new_value == "Dining"
+
+    def test_updates_payee(self):
+        txn = make_transaction(payee_name="HEB")
+        updates, changes = compute_transaction_updates(txn, payee_name="Costco")
+        assert updates == {"payee_name": "Costco"}
+        assert changes[0].old_value == "HEB"
+        assert changes[0].new_value == "Costco"
+
+    def test_updates_date(self):
+        txn = make_transaction(date="2025-01-15")
+        updates, changes = compute_transaction_updates(txn, date="2025-01-20")
+        assert updates == {"date": "2025-01-20"}
+        assert changes[0].old_value == "2025-01-15"
+        assert changes[0].new_value == "2025-01-20"
+
+    def test_updates_amount(self):
+        txn = make_transaction(amount=-45000)
+        updates, changes = compute_transaction_updates(txn, amount_milliunits=-60000)
+        assert updates == {"amount": -60000}
+        assert changes[0].field_name == "Amount"
+        assert "$45.00" in changes[0].old_value
+        assert "$60.00" in changes[0].new_value
+
+    def test_updates_flag_color(self):
+        txn = make_transaction()
+        updates, changes = compute_transaction_updates(txn, flag_color="red")
+        assert updates == {"flag_color": "red"}
+        assert changes[0].old_value == "(none)"
+        assert changes[0].new_value == "red"
+
+    def test_updates_cleared(self):
+        txn = make_transaction()
+        updates, changes = compute_transaction_updates(txn, cleared="cleared")
+        assert updates == {"cleared": "cleared"}
+        assert changes[0].old_value == "uncleared"
+        assert changes[0].new_value == "cleared"
+
+    def test_skips_unchanged_fields(self):
+        txn = make_transaction(memo="same memo", payee_name="HEB")
+        updates, changes = compute_transaction_updates(
+            txn, memo="same memo", payee_name="HEB"
+        )
+        assert updates == {}
+        assert changes == []
+
+    def test_multiple_fields_at_once(self):
+        txn = make_transaction(memo=None, payee_name="HEB", date="2025-01-15")
+        updates, changes = compute_transaction_updates(
+            txn, memo="new note", payee_name="Costco", date="2025-02-01"
+        )
+        assert "memo" in updates
+        assert "payee_name" in updates
+        assert "date" in updates
+        assert len(changes) == 3
+
+    def test_none_parameters_are_ignored(self):
+        txn = make_transaction()
+        updates, changes = compute_transaction_updates(txn)
+        assert updates == {}
+        assert changes == []
+
+
+# --- Scheduled Transaction Lookup ---
+
+
+class TestFindScheduledTransactionByDescription:
+    def test_finds_by_payee(self):
+        sts = [make_scheduled_transaction(payee_name="Netflix")]
+        result = filter_scheduled_transaction_by_description(sts, "Netflix")
+        assert result is not None
+        assert result.payee_name == "Netflix"
+
+    def test_finds_by_date_next(self):
+        sts = [make_scheduled_transaction(date_next="2025-02-01")]
+        result = filter_scheduled_transaction_by_description(sts, "2025-02-01")
+        assert result is not None
+
+    def test_finds_by_amount(self):
+        sts = [make_scheduled_transaction(amount=-15990)]
+        result = filter_scheduled_transaction_by_description(sts, "15.99")
+        assert result is not None
+
+    def test_skips_deleted(self):
+        sts = [make_scheduled_transaction(payee_name="Netflix", deleted=True)]
+        result = filter_scheduled_transaction_by_description(sts, "Netflix")
+        assert result is None
+
+    def test_no_match_returns_none(self):
+        sts = [make_scheduled_transaction(payee_name="Netflix")]
+        result = filter_scheduled_transaction_by_description(sts, "Spotify")
+        assert result is None
+
+
+# --- Scheduled Transaction Update Builder ---
+
+
+class TestComputeScheduledTransactionUpdates:
+    def test_updates_date(self):
+        st = make_scheduled_transaction(date_next="2025-02-01")
+        payload, changes = compute_scheduled_transaction_updates(st, date="2025-03-01")
+        assert payload == {"date": "2025-03-01"}
+        assert len(changes) == 1
+        assert changes[0] == FieldChange(field_name="Date", old_value="2025-02-01", new_value="2025-03-01")
+
+    def test_updates_frequency(self):
+        st = make_scheduled_transaction(frequency="monthly")
+        payload, changes = compute_scheduled_transaction_updates(st, frequency_value="weekly")
+        assert payload == {"frequency": "weekly"}
+        assert changes[0] == FieldChange(field_name="Frequency", old_value="monthly", new_value="weekly")
+
+    def test_updates_amount(self):
+        st = make_scheduled_transaction(amount=-15990)
+        new_amt = dollars_to_milliunits(-abs(20.0))
+        payload, changes = compute_scheduled_transaction_updates(st, amount_milliunits=new_amt)
+        assert payload == {"amount": new_amt}
+        assert changes[0].field_name == "Amount"
+        assert "$15.99" in changes[0].old_value
+        assert "$20.00" in changes[0].new_value
+
+    def test_updates_payee(self):
+        st = make_scheduled_transaction(payee_name="Netflix")
+        payload, changes = compute_scheduled_transaction_updates(st, payee="Hulu")
+        assert payload == {"payee_name": "Hulu"}
+        assert changes[0] == FieldChange(field_name="Payee", old_value="Netflix", new_value="Hulu")
+
+    def test_updates_category(self):
+        st = make_scheduled_transaction(category_name="Subscriptions")
+        payload, changes = compute_scheduled_transaction_updates(
+            st, category_id="cat-entertainment", category_name="Entertainment"
+        )
+        assert payload == {"category_id": "cat-entertainment"}
+        assert changes[0] == FieldChange(field_name="Category", old_value="Subscriptions", new_value="Entertainment")
+
+    def test_updates_memo(self):
+        st = make_scheduled_transaction(memo="old note")
+        payload, changes = compute_scheduled_transaction_updates(st, memo="new note")
+        assert payload == {"memo": "new note"}
+        assert changes[0] == FieldChange(field_name="Memo", old_value="old note", new_value="new note")
+
+    def test_clears_memo(self):
+        st = make_scheduled_transaction(memo="old note")
+        payload, changes = compute_scheduled_transaction_updates(st, memo="")
+        assert payload == {"memo": ""}
+        assert changes[0] == FieldChange(field_name="Memo", old_value="old note", new_value="(cleared)")
+
+    def test_updates_flag(self):
+        st = make_scheduled_transaction()
+        payload, changes = compute_scheduled_transaction_updates(st, flag_color="red")
+        assert payload == {"flag_color": "red"}
+        assert changes[0] == FieldChange(field_name="Flag", old_value="(none)", new_value="red")
+
+    def test_none_parameters_are_ignored(self):
+        st = make_scheduled_transaction()
+        payload, changes = compute_scheduled_transaction_updates(st)
+        assert payload == {}
+        assert changes == []
+
+    def test_multiple_fields_at_once(self):
+        st = make_scheduled_transaction(payee_name="Netflix", memo=None)
+        payload, changes = compute_scheduled_transaction_updates(
+            st, payee="Hulu", memo="shared account", date="2025-04-01"
+        )
+        assert "payee_name" in payload
+        assert "memo" in payload
+        assert "date" in payload
+        assert len(changes) == 3
+
+
+# --- Bulk Transaction Update Builder ---
+
+
+class TestComputeBulkTransactionUpdateInputs:
+    def test_matches_and_builds_updates(self):
+        txns = [make_transaction(payee_name="HEB", amount=-45000)]
+        groups = [make_category_group(
+            name="Food", categories=[make_category(name="Dining", group_id="grp-food")]
+        )]
+        updates = [BulkTransactionUpdateInput(
+            transaction_description="HEB", category_name="Dining"
+        )]
+        api_updates, errors = compute_bulk_transaction_updates(txns, groups, updates)
+        assert len(api_updates) == 1
+        assert api_updates[0]["category_id"] == "cat-dining"
+        assert errors == []
+
+    def test_collects_unmatched_errors(self):
+        txns = [make_transaction(payee_name="HEB")]
+        groups = []
+        updates = [BulkTransactionUpdateInput(
+            transaction_description="Nonexistent", memo="test"
+        )]
+        api_updates, errors = compute_bulk_transaction_updates(txns, groups, updates)
+        assert len(api_updates) == 0
+        assert len(errors) == 1
+        assert "Nonexistent" in errors[0]
+
+    def test_deduplicates_by_transaction_id(self):
+        txns = [make_transaction(payee_name="HEB", date="2025-01-15")]
+        groups = []
+        updates = [
+            BulkTransactionUpdateInput(transaction_description="HEB", memo="first"),
+            BulkTransactionUpdateInput(transaction_description="HEB", memo="second"),
+        ]
+        api_updates, errors = compute_bulk_transaction_updates(txns, groups, updates)
+        assert len(api_updates) == 1
+        assert api_updates[0]["memo"] == "second"
+
+    def test_updates_flag_and_cleared(self):
+        txns = [make_transaction(payee_name="HEB")]
+        groups = []
+        updates = [BulkTransactionUpdateInput(
+            transaction_description="HEB", flag_color=TransactionFlagColor.RED, approved=True
+        )]
+        api_updates, errors = compute_bulk_transaction_updates(txns, groups, updates)
+        assert len(api_updates) == 1
+        assert api_updates[0]["flag_color"] == "red"
+        assert api_updates[0]["approved"] is True
+
+
+# --- Category Target Updates ---
+
+
+class TestComputeCategoryTargetUpdates:
+    def test_set_new_target_no_existing_goal(self):
+        cat = make_category(name="Vacation", budgeted=100_000, balance=50_000)
+        updates, result = compute_category_target_updates(
+            cat, target_amount_milliunits=500_000, target_date=None, clear=False
+        )
+        assert updates == {"goal_target": 500_000}
+        assert result.action == "set"
+        assert result.new_target == 500.0
+        assert result.old_target is None
+        assert result.new_target_date is None
+
+    def test_update_existing_target(self):
+        cat = make_category(
+            name="Vacation", goal_type="NEED", goal_target=300_000
+        )
+        updates, result = compute_category_target_updates(
+            cat, target_amount_milliunits=500_000, target_date=None, clear=False
+        )
+        assert updates == {"goal_target": 500_000}
+        assert result.action == "updated"
+        assert result.old_target == 300.0
+        assert result.new_target == 500.0
+
+    def test_set_target_with_date(self):
+        cat = make_category(name="Vacation")
+        updates, result = compute_category_target_updates(
+            cat,
+            target_amount_milliunits=2_000_000,
+            target_date="2026-12-01",
+            clear=False,
+        )
+        assert updates == {"goal_target": 2_000_000, "goal_target_date": "2026-12-01"}
+        assert result.action == "set"
+        assert result.new_target == 2000.0
+        assert result.new_target_date == "2026-12-01"
+
+    def test_clear_target(self):
+        cat = make_category(
+            name="Vacation",
+            goal_type="NEED",
+            goal_target=500_000,
+            goal_target_date="2026-06-01",
+        )
+        updates, result = compute_category_target_updates(
+            cat, target_amount_milliunits=None, target_date=None, clear=True
+        )
+        assert updates == {"goal_target": None, "goal_target_date": None}
+        assert result.action == "removed"
+        assert result.old_target == 500.0
+        assert result.old_target_date == "2026-06-01"
+        assert result.new_target is None
+
+    def test_clear_target_with_no_prior_goal(self):
+        cat = make_category(name="Vacation")
+        updates, result = compute_category_target_updates(
+            cat, target_amount_milliunits=None, target_date=None, clear=True
+        )
+        assert result.action == "removed"
+        assert result.old_target is None
+        assert result.old_target_date is None
