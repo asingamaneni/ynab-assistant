@@ -2,8 +2,8 @@
 
 import pytest
 
-from tests.conftest import make_account, make_category, make_category_group
-from src.core.resolvers import ResolverError, resolve_account, resolve_category
+from tests.conftest import make_account, make_category, make_category_group, make_payee
+from src.core.resolvers import ResolverError, resolve_account, resolve_category, resolve_category_or_inflow, resolve_payee
 
 
 class TestResolveAccount:
@@ -80,3 +80,74 @@ class TestResolveCategory:
         ]
         with pytest.raises(ResolverError):
             resolve_category(groups, "Entertainment")
+
+
+class TestResolveCategoryOrInflow:
+    def _make_groups_with_inflow(self):
+        inflow_cat = make_category("Inflow: Ready to Assign", group_id="grp-internal")
+        return [
+            make_category_group(
+                "Internal Master Category",
+                categories=[inflow_cat],
+            ),
+            make_category_group("Food", categories=[make_category("Groceries")]),
+        ]
+
+    def test_resolves_inflow_category(self):
+        groups = self._make_groups_with_inflow()
+        result = resolve_category_or_inflow(groups, "Inflow: Ready to Assign")
+        assert result.name == "Inflow: Ready to Assign"
+
+    def test_resolves_inflow_partial_match(self):
+        groups = self._make_groups_with_inflow()
+        result = resolve_category_or_inflow(groups, "inflow")
+        assert result.name == "Inflow: Ready to Assign"
+
+    def test_resolves_inflow_case_insensitive(self):
+        groups = self._make_groups_with_inflow()
+        result = resolve_category_or_inflow(groups, "INFLOW")
+        assert result.name == "Inflow: Ready to Assign"
+
+    def test_ready_to_assign_alias_resolves_inflow(self):
+        """'ready to assign' is an explicit inflow alias."""
+        groups = self._make_groups_with_inflow()
+        result = resolve_category_or_inflow(groups, "ready to assign")
+        assert result.name == "Inflow: Ready to Assign"
+
+    def test_substring_inflow_falls_through(self):
+        """'cashflow' contains 'inflow' as a substring but should NOT match the inflow category."""
+        groups = self._make_groups_with_inflow()
+        with pytest.raises(ResolverError):
+            resolve_category_or_inflow(groups, "cashflow")
+
+    def test_falls_back_to_regular_category(self):
+        groups = self._make_groups_with_inflow()
+        result = resolve_category_or_inflow(groups, "Groceries")
+        assert result.name == "Groceries"
+
+    def test_no_match_raises(self):
+        groups = self._make_groups_with_inflow()
+        with pytest.raises(ResolverError):
+            resolve_category_or_inflow(groups, "Entertainment")
+
+
+class TestResolvePayee:
+    def test_exact_name_match(self):
+        payees = [make_payee("HEB"), make_payee("Costco")]
+        assert resolve_payee(payees, "HEB").name == "HEB"
+
+    def test_partial_case_insensitive(self):
+        payees = [make_payee("HEB"), make_payee("Costco")]
+        assert resolve_payee(payees, "he").name == "HEB"
+
+    def test_skips_deleted_payees(self):
+        payees = [make_payee("HEB", deleted=True)]
+        with pytest.raises(ResolverError):
+            resolve_payee(payees, "HEB")
+
+    def test_no_match_raises(self):
+        payees = [make_payee("HEB"), make_payee("Costco")]
+        with pytest.raises(ResolverError) as exc_info:
+            resolve_payee(payees, "Walmart")
+        assert "HEB" in str(exc_info.value)
+        assert "Costco" in str(exc_info.value)

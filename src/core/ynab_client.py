@@ -12,13 +12,17 @@ import httpx
 from src.models.schemas import (
     Account,
     Budget,
+    BudgetSettings,
     Category,
     CategoryGroup,
     CreateTransactionInput,
     MonthSummary,
     Payee,
+    PayeeLocation,
+    ScheduledTransaction,
     Transaction,
     UpdateCategoryInput,
+    User,
 )
 
 BASE_URL = "https://api.ynab.com/v1"
@@ -44,6 +48,7 @@ class YNABClient:
         self.budget_id = budget_id
         self._client: Optional[httpx.AsyncClient] = None
         self._server_knowledge: dict[str, int] = {}
+        self._delta_cache: dict[str, dict[str, dict[str, Any]]] = {}
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -60,6 +65,32 @@ class YNABClient:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
+    def _merge_delta(
+        self, path: str, items: list[dict[str, Any]],
+        id_field: str = "id",
+    ) -> list[dict[str, Any]]:
+        """Merge delta response items into the cache and return the full list.
+
+        Each item is keyed by *id_field* (default ``"id"``).  Items with
+        ``"deleted": True`` are removed from the cache.  All other items
+        are upserted by their key.
+        """
+        if path not in self._delta_cache:
+            self._delta_cache[path] = {}
+
+        cache = self._delta_cache[path]
+
+        for item in items:
+            item_id = item.get(id_field)
+            if not item_id:
+                continue
+            if item.get("deleted", False):
+                cache.pop(item_id, None)
+            else:
+                cache[item_id] = item
+
+        return list(cache.values())
+
     async def _request(
         self,
         method: str,
@@ -67,8 +98,15 @@ class YNABClient:
         params: Optional[dict[str, Any]] = None,
         json_data: Optional[dict[str, Any]] = None,
         use_delta: bool = False,
+        delta_key: str | None = None,
+        delta_id_field: str = "id",
     ) -> dict[str, Any]:
-        """Make an authenticated request to the YNAB API."""
+        """Make an authenticated request to the YNAB API.
+
+        When *use_delta* is ``True`` and *delta_key* names the list field in
+        the response (e.g. ``"accounts"``), the client merges incremental
+        results into a local cache so callers always receive the full list.
+        """
         if params is None:
             params = {}
 
@@ -102,8 +140,13 @@ class YNABClient:
 
         data = response.json().get("data", {})
 
-        if "server_knowledge" in data:
+        if use_delta and "server_knowledge" in data:
             self._server_knowledge[path] = data["server_knowledge"]
+
+        if use_delta and delta_key and delta_key in data:
+            data[delta_key] = self._merge_delta(
+                path, data[delta_key], id_field=delta_id_field,
+            )
 
         return data
 
@@ -125,7 +168,9 @@ class YNABClient:
     async def get_accounts(self, budget_id: Optional[str] = None) -> list[Account]:
         """Get all accounts for a budget."""
         bid = budget_id or self.budget_id
-        data = await self._request("GET", f"/budgets/{bid}/accounts", use_delta=True)
+        data = await self._request(
+            "GET", f"/budgets/{bid}/accounts", use_delta=True, delta_key="accounts"
+        )
         return [Account(**a) for a in data.get("accounts", [])]
 
     async def get_account(
@@ -134,6 +179,22 @@ class YNABClient:
         """Get a specific account."""
         bid = budget_id or self.budget_id
         data = await self._request("GET", f"/budgets/{bid}/accounts/{account_id}")
+        return Account(**data.get("account", {}))
+
+    async def create_account(
+        self,
+        name: str,
+        type_: str,
+        balance: int,  # milliunits
+        budget_id: str | None = None,
+    ) -> Account:
+        """Create a new account."""
+        bid = budget_id or self.budget_id
+        data = await self._request(
+            "POST",
+            f"/budgets/{bid}/accounts",
+            json_data={"account": {"name": name, "type": type_, "balance": balance}},
+        )
         return Account(**data.get("account", {}))
 
     # --- Categories ---
@@ -174,6 +235,21 @@ class YNABClient:
         )
         return Category(**data.get("category", {}))
 
+    async def update_category_metadata(
+        self,
+        category_id: str,
+        updates: dict[str, Any],
+        budget_id: str | None = None,
+    ) -> Category:
+        """Update a category's name and/or note."""
+        bid = budget_id or self.budget_id
+        data = await self._request(
+            "PATCH",
+            f"/budgets/{bid}/categories/{category_id}",
+            json_data={"category": updates},
+        )
+        return Category(**data.get("category", {}))
+
     # --- Transactions ---
 
     async def get_transactions(
@@ -196,7 +272,14 @@ class YNABClient:
         else:
             path = f"/budgets/{bid}/transactions"
 
-        data = await self._request("GET", path, params=params, use_delta=True)
+        has_filter = since_date or account_id or category_id
+        data = await self._request(
+            "GET",
+            path,
+            params=params,
+            use_delta=not has_filter,
+            delta_key="transactions" if not has_filter else None,
+        )
         return [Transaction(**t) for t in data.get("transactions", [])]
 
     async def get_transaction(
@@ -223,6 +306,21 @@ class YNABClient:
         )
         return Transaction(**data.get("transaction", {}))
 
+    async def delete_transaction(
+        self,
+        transaction_id: str,
+        budget_id: str | None = None,
+    ) -> None:
+        """Delete a transaction."""
+        bid = budget_id or self.budget_id
+        await self._request(
+            "DELETE", f"/budgets/{bid}/transactions/{transaction_id}"
+        )
+        # Evict from delta cache so subsequent reads don't serve stale data
+        path = f"/budgets/{bid}/transactions"
+        if path in self._delta_cache:
+            self._delta_cache[path].pop(transaction_id, None)
+
     async def update_transaction(
         self,
         transaction_id: str,
@@ -238,20 +336,88 @@ class YNABClient:
         )
         return Transaction(**data.get("transaction", {}))
 
+    async def import_transactions(
+        self,
+        budget_id: str | None = None,
+    ) -> list[str]:
+        """Trigger linked account import. Returns imported transaction IDs."""
+        bid = budget_id or self.budget_id
+        data = await self._request("POST", f"/budgets/{bid}/transactions/import")
+        return data.get("transaction_ids", [])
+
+    async def bulk_update_transactions(
+        self,
+        transactions: list[dict[str, Any]],
+        budget_id: str | None = None,
+    ) -> list[Transaction]:
+        """Update multiple transactions at once."""
+        bid = budget_id or self.budget_id
+        data = await self._request(
+            "PATCH",
+            f"/budgets/{bid}/transactions",
+            json_data={"transactions": transactions},
+        )
+        return [Transaction(**t) for t in data.get("transactions", [])]
+
     # --- Payees ---
 
     async def get_payees(self, budget_id: Optional[str] = None) -> list[Payee]:
         """Get all payees."""
         bid = budget_id or self.budget_id
-        data = await self._request("GET", f"/budgets/{bid}/payees", use_delta=True)
+        data = await self._request(
+            "GET", f"/budgets/{bid}/payees", use_delta=True, delta_key="payees"
+        )
         return [Payee(**p) for p in data.get("payees", [])]
+
+    async def update_payee(
+        self,
+        payee_id: str,
+        name: str,
+        budget_id: str | None = None,
+    ) -> Payee:
+        """Update a payee's name."""
+        bid = budget_id or self.budget_id
+        data = await self._request(
+            "PATCH",
+            f"/budgets/{bid}/payees/{payee_id}",
+            json_data={"payee": {"name": name}},
+        )
+        return Payee(**data.get("payee", {}))
+
+    async def get_payee_transactions(
+        self,
+        payee_id: str,
+        since_date: str | None = None,
+        budget_id: str | None = None,
+    ) -> list[Transaction]:
+        """Get transactions for a specific payee."""
+        bid = budget_id or self.budget_id
+        params: dict[str, Any] = {}
+        if since_date:
+            params["since_date"] = since_date
+        data = await self._request(
+            "GET", f"/budgets/{bid}/payees/{payee_id}/transactions", params=params
+        )
+        return [Transaction(**t) for t in data.get("transactions", [])]
+
+    async def get_payee_locations(
+        self,
+        budget_id: str | None = None,
+    ) -> list[PayeeLocation]:
+        """Get all payee locations."""
+        bid = budget_id or self.budget_id
+        data = await self._request("GET", f"/budgets/{bid}/payee_locations")
+        return [PayeeLocation(**pl) for pl in data.get("payee_locations", [])]
 
     # --- Month Summaries ---
 
     async def get_months(self, budget_id: Optional[str] = None) -> list[MonthSummary]:
         """Get budget month summaries."""
         bid = budget_id or self.budget_id
-        data = await self._request("GET", f"/budgets/{bid}/months", use_delta=True)
+        data = await self._request(
+            "GET", f"/budgets/{bid}/months",
+            use_delta=True, delta_key="months", delta_id_field="month",
+        )
         return [MonthSummary(**m) for m in data.get("months", [])]
 
     async def get_month(
@@ -261,3 +427,89 @@ class YNABClient:
         bid = budget_id or self.budget_id
         data = await self._request("GET", f"/budgets/{bid}/months/{month}")
         return data.get("month", {})
+
+    async def get_budget_settings(
+        self,
+        budget_id: str | None = None,
+    ) -> BudgetSettings:
+        """Get budget settings (date format, currency format)."""
+        bid = budget_id or self.budget_id
+        data = await self._request("GET", f"/budgets/{bid}/settings")
+        return BudgetSettings(**data.get("settings", {}))
+
+    # --- User ---
+
+    async def get_user(self) -> User:
+        """Get the authenticated user."""
+        data = await self._request("GET", "/user")
+        return User(**data.get("user", {}))
+
+    # --- Scheduled Transactions ---
+
+    async def get_scheduled_transactions(
+        self,
+        budget_id: str | None = None,
+    ) -> list[ScheduledTransaction]:
+        """Get all scheduled transactions."""
+        bid = budget_id or self.budget_id
+        data = await self._request(
+            "GET", f"/budgets/{bid}/scheduled_transactions"
+        )
+        return [
+            ScheduledTransaction(**st)
+            for st in data.get("scheduled_transactions", [])
+        ]
+
+    async def get_scheduled_transaction(
+        self,
+        scheduled_transaction_id: str,
+        budget_id: str | None = None,
+    ) -> ScheduledTransaction:
+        """Get a specific scheduled transaction."""
+        bid = budget_id or self.budget_id
+        data = await self._request(
+            "GET",
+            f"/budgets/{bid}/scheduled_transactions/{scheduled_transaction_id}",
+        )
+        return ScheduledTransaction(**data.get("scheduled_transaction", {}))
+
+    async def create_scheduled_transaction(
+        self,
+        payload: dict[str, Any],
+        budget_id: str | None = None,
+    ) -> ScheduledTransaction:
+        """Create a new scheduled transaction."""
+        bid = budget_id or self.budget_id
+        data = await self._request(
+            "POST",
+            f"/budgets/{bid}/scheduled_transactions",
+            json_data={"scheduled_transaction": payload},
+        )
+        return ScheduledTransaction(**data.get("scheduled_transaction", {}))
+
+    async def update_scheduled_transaction(
+        self,
+        scheduled_transaction_id: str,
+        payload: dict[str, Any],
+        budget_id: str | None = None,
+    ) -> ScheduledTransaction:
+        """Update a scheduled transaction."""
+        bid = budget_id or self.budget_id
+        data = await self._request(
+            "PUT",
+            f"/budgets/{bid}/scheduled_transactions/{scheduled_transaction_id}",
+            json_data={"scheduled_transaction": payload},
+        )
+        return ScheduledTransaction(**data.get("scheduled_transaction", {}))
+
+    async def delete_scheduled_transaction(
+        self,
+        scheduled_transaction_id: str,
+        budget_id: str | None = None,
+    ) -> None:
+        """Delete a scheduled transaction."""
+        bid = budget_id or self.budget_id
+        await self._request(
+            "DELETE",
+            f"/budgets/{bid}/scheduled_transactions/{scheduled_transaction_id}",
+        )

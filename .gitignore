@@ -11,3 +11,4 @@ node_modules/
 .pytest_cache/
 .history/
 .playwright-mcp/
+.claude/daily-review-last-run
