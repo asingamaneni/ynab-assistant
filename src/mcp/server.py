@@ -181,6 +181,26 @@ async def ynab_get_budgets(ctx: Context) -> str:
 
 
 @mcp.tool(
+    name="ynab_refresh_cache",
+    annotations={
+        "title": "Refresh Cache",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+@handle_tool_errors
+async def ynab_refresh_cache(ctx: Context) -> str:
+    """Force-refresh the transaction cache. Use when transactions can't be found."""
+    ynab, _ = _get_deps(ctx)
+    ynab.refresh_cache()
+    # Immediately re-populate by fetching all transactions
+    transactions = await ynab.get_transactions()
+    return f"Cache refreshed. {len(transactions)} transactions loaded."
+
+
+@mcp.tool(
     name="ynab_get_accounts",
     annotations={
         "title": "List YNAB Accounts",
@@ -557,17 +577,14 @@ async def ynab_categorize_transaction(params: CategorizeTransactionInput, ctx: C
     # Find the uncategorized transaction matching the description
     transactions = await ynab.get_transactions()
     uncategorized = filter_uncategorized_transactions(transactions)
+    matched = filter_transaction_by_description(uncategorized, params.transaction_description)
 
-    query = params.transaction_description.lower()
-    matched = None
-    for t in uncategorized:
-        amount_str = f"{abs(milliunits_to_dollars(t.amount)):,.2f}"
-        if (query in (t.payee_name or "").lower()
-                or query in (t.memo or "").lower()
-                or query in t.date
-                or query in amount_str):
-            matched = t
-            break
+    # Auto-retry with cache refresh if not found
+    if not matched:
+        ynab.refresh_cache()
+        transactions = await ynab.get_transactions()
+        uncategorized = filter_uncategorized_transactions(transactions)
+        matched = filter_transaction_by_description(uncategorized, params.transaction_description)
 
     if not matched:
         return f"No uncategorized transaction found matching '{params.transaction_description}'."
@@ -612,6 +629,12 @@ async def ynab_recategorize_transaction(params: RecategorizeTransactionInput, ct
     # Search all non-deleted transactions
     transactions = await ynab.get_transactions()
     matched = filter_transaction_by_description(transactions, params.transaction_description)
+
+    # Auto-retry with cache refresh if not found
+    if not matched:
+        ynab.refresh_cache()
+        transactions = await ynab.get_transactions()
+        matched = filter_transaction_by_description(transactions, params.transaction_description)
 
     if not matched:
         return f"No transaction found matching '{params.transaction_description}'."
@@ -658,6 +681,13 @@ async def ynab_update_transaction(params: UpdateTransactionInput, ctx: Context) 
     # 1. Find the transaction
     transactions = await ynab.get_transactions()
     matched = filter_transaction_by_description(transactions, params.transaction_description)
+
+    # Auto-retry with cache refresh if not found
+    if not matched:
+        ynab.refresh_cache()
+        transactions = await ynab.get_transactions()
+        matched = filter_transaction_by_description(transactions, params.transaction_description)
+
     if not matched:
         return f"No transaction found matching '{params.transaction_description}'."
 
@@ -954,6 +984,13 @@ async def ynab_delete_transaction(params: DeleteTransactionInput, ctx: Context) 
 
     transactions = await ynab.get_transactions()
     matched = filter_transaction_by_description(transactions, params.transaction_description)
+
+    # Auto-retry with cache refresh if not found
+    if not matched:
+        ynab.refresh_cache()
+        transactions = await ynab.get_transactions()
+        matched = filter_transaction_by_description(transactions, params.transaction_description)
+
     if not matched:
         return f"No transaction found matching '{params.transaction_description}'."
 
@@ -1168,6 +1205,14 @@ async def ynab_bulk_update_transactions(params: BulkUpdateTransactionsInput, ctx
     api_updates, errors = compute_bulk_transaction_updates(
         transactions, groups, params.updates
     )
+
+    # Auto-retry with cache refresh if there were lookup errors
+    if errors:
+        ynab.refresh_cache()
+        transactions = await ynab.get_transactions()
+        api_updates, errors = compute_bulk_transaction_updates(
+            transactions, groups, params.updates
+        )
 
     if api_updates:
         await ynab.bulk_update_transactions(api_updates)

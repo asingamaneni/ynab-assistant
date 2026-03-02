@@ -138,11 +138,15 @@ def filter_transaction_by_description(
     """Find a non-deleted transaction matching a search query.
 
     Searches across payee name, memo, date, and formatted amount.
-    Returns the first match or ``None``.
+    First tries exact substring match per field (fast path), then
+    falls back to multi-token search across all fields combined.
+    Returns the best match or ``None``.
     """
-    q = query.lower()
+    q = query.lower().strip()
     if not q:
         return None
+
+    # Fast path: exact substring match on a single field
     for t in transactions:
         if t.deleted:
             continue
@@ -154,7 +158,33 @@ def filter_transaction_by_description(
             or q in amount_str
         ):
             return t
-    return None
+
+    # Multi-token search: split query into tokens, match across fields
+    tokens = [tok.lstrip("$") for tok in q.split()]
+    tokens = [tok for tok in tokens if tok]  # drop empty after strip
+    if len(tokens) <= 1:
+        return None  # Single token already tried above
+
+    best: Transaction | None = None
+    best_score = 0
+
+    for t in transactions:
+        if t.deleted:
+            continue
+        payee = (t.payee_name or "").lower()
+        memo = (t.memo or "").lower()
+        date_str = t.date
+        amount_str = f"{abs(milliunits_to_dollars(t.amount)):,.2f}"
+        combined = f"{payee} {memo} {date_str} {amount_str}"
+
+        if all(tok in combined for tok in tokens):
+            # Score: prefer payee matches
+            score = sum(1 for tok in tokens if tok in payee)
+            if best is None or score > best_score:
+                best = t
+                best_score = score
+
+    return best
 
 
 # --- Scheduled Transaction Lookup ---

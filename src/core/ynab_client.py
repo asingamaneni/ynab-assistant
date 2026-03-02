@@ -65,6 +65,11 @@ class YNABClient:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
+    def refresh_cache(self) -> None:
+        """Clear all delta caches so the next request fetches fresh data."""
+        self._server_knowledge.clear()
+        self._delta_cache.clear()
+
     def _merge_delta(
         self, path: str, items: list[dict[str, Any]],
         id_field: str = "id",

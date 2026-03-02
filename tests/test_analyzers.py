@@ -161,6 +161,23 @@ class TestFindTransactionByDescription:
         assert result is not None
         assert result.category_name == "Business"
 
+    def test_multi_token_strips_dollar_sign(self):
+        txns = [
+            make_transaction(payee_name="Transfer : Discover", date="2026-02-23", amount=-24740),
+            make_transaction(payee_name="Some Other", date="2026-02-23", amount=-24740),
+        ]
+        result = filter_transaction_by_description(txns, "Transfer : Discover 2026-02-23 $24.74")
+        assert result is not None
+        assert result.payee_name == "Transfer : Discover"
+
+    def test_multi_token_matches_across_fields(self):
+        txns = [
+            make_transaction(payee_name="Transfer : Capital One", date="2026-02-20", amount=-4138210, memo="Monthly CC payment"),
+        ]
+        result = filter_transaction_by_description(txns, "Transfer : Capital One 2026-02-20 $4,138.21")
+        assert result is not None
+        assert result.payee_name == "Transfer : Capital One"
+
 
 # --- Cover Overspending ---
 
